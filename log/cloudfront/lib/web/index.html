@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title data-i18n="docTitle">Connect AI Agent 日志排查 · CloudWatch</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --panel: #171a22;
+    --panel-2: #1e222c;
+    --border: #2a2f3a;
+    --text: #e6e8ee;
+    --muted: #9aa3b2;
+    --accent: #4f9cff;
+    --green: #3fb950;
+    --red: #f85149;
+    --amber: #d29922;
+    --purple: #a371f7;
+    --cyan: #39c5cf;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+  header {
+    padding: 12px 18px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  header .meta { color: var(--muted); font-size: 12px; }
+  .layout { flex: 1; display: flex; min-height: 0; }
+  .sidebar {
+    width: 340px;
+    min-width: 280px;
+    border-right: 1px solid var(--border);
+    background: var(--panel);
+    display: flex;
+    flex-direction: column;
+  }
+  .search {
+    padding: 10px 10px 8px;
+  }
+  .search input {
+    width: 100%;
+    padding: 8px 10px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font-size: 13px;
+  }
+  .search input::placeholder { color: var(--muted); }
+  .sort {
+    padding: 0 10px 10px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .sort label { font-size: 12px; color: var(--muted); white-space: nowrap; }
+  .sort select {
+    flex: 1;
+    padding: 6px 8px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .contact-list { overflow-y: auto; flex: 1; }
+  .contact-item {
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+    cursor: pointer;
+  }
+  .contact-item:hover { background: var(--panel-2); }
+  .contact-item.active { background: var(--panel-2); border-left: 3px solid var(--accent); padding-left: 9px; }
+  .cid-row { display: flex; align-items: flex-start; gap: 6px; }
+  .contact-item .cid { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: var(--accent); word-break: break-all; flex: 1; min-width: 0; }
+  .cid-actions { display: flex; gap: 2px; flex-shrink: 0; }
+  .icon-btn {
+    background: transparent; border: 1px solid var(--border); color: var(--muted);
+    border-radius: 4px; cursor: pointer; font-size: 12px; line-height: 1;
+    padding: 3px 6px; transition: all 0.12s;
+  }
+  .icon-btn:hover { color: var(--text); border-color: var(--accent); background: var(--panel); }
+  .icon-btn.ok { color: var(--green); border-color: var(--green); }
+  .contact-item .sub { font-size: 11px; color: var(--muted); margin-top: 4px; }
+  .badges { margin-top: 6px; display: flex; gap: 6px; flex-wrap: wrap; }
+  .badge {
+    font-size: 10px; padding: 2px 6px; border-radius: 10px;
+    background: var(--panel-2); border: 1px solid var(--border); color: var(--muted);
+  }
+  .badge.err { color: var(--red); border-color: var(--red); }
+  .badge.esc { color: var(--amber); border-color: var(--amber); }
+  .badge.ok { color: var(--green); border-color: var(--green); }
+  .badge.gw { color: var(--cyan); border-color: var(--cyan); }
+
+  .main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  .toolbar {
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  }
+  .toolbar .title { font-family: ui-monospace, monospace; font-size: 13px; color: var(--accent); }
+  .filters { display: flex; gap: 6px; flex-wrap: wrap; margin-left: auto; }
+  .filter-chip {
+    font-size: 11px; padding: 3px 9px; border-radius: 12px; cursor: pointer;
+    border: 1px solid var(--border); background: var(--panel-2); color: var(--muted); user-select: none;
+  }
+  .filter-chip.on { color: var(--text); border-color: var(--accent); }
+
+  .timeline { overflow-y: auto; flex: 1; padding: 14px 16px; }
+  .empty { color: var(--muted); text-align: center; margin-top: 80px; font-size: 14px; }
+
+  .event {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-bottom: 10px;
+    background: var(--panel);
+    overflow: hidden;
+  }
+  .event-head {
+    display: flex; align-items: center; gap: 10px;
+    padding: 9px 12px; cursor: pointer;
+  }
+  .event-head:hover { background: var(--panel-2); }
+  .ev-time { font-family: ui-monospace, monospace; font-size: 11px; color: var(--muted); white-space: nowrap; }
+  .ev-type {
+    font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 4px;
+    background: var(--panel-2); white-space: nowrap;
+  }
+  .ev-summary { flex: 1; font-size: 13px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ev-tag { font-size: 10px; padding: 1px 6px; border-radius: 4px; border: 1px solid var(--border); color: var(--muted); }
+  .ev-tag.err { color: var(--red); border-color: var(--red); }
+  .ev-tag.ok { color: var(--green); border-color: var(--green); }
+
+  .event-body { display: none; padding: 0 12px 12px; }
+  .event.open .event-body { display: block; }
+  .kv { font-size: 12px; color: var(--muted); margin: 2px 0; }
+  .kv b { color: var(--text); font-weight: 600; }
+  .bubble {
+    margin: 8px 0; padding: 8px 12px; border-radius: 8px; font-size: 13px;
+    white-space: pre-wrap; word-break: break-word; line-height: 1.5;
+  }
+  /* 对话气泡: 客户=中性灰, 机器人=蓝(参考 MEG_analysis) */
+  .bubble.customer { background: rgba(154,160,176,.14); border: 1px solid rgba(154,160,176,.4); }
+  .bubble.bot { background: rgba(79,140,255,.14); border: 1px solid rgba(79,140,255,.45); }
+  .bubble.thinking { background: #25202f; border: 1px solid #3a2f4f; color: var(--muted); font-style: italic; }
+  /* 高亮的译文气泡 */
+  .bubble.translated { background: #2c2410; border: 1px solid var(--amber); box-shadow: 0 0 0 1px rgba(210,153,34,0.25) inset; }
+  .trans-badge {
+    display: inline-block; font-size: 10px; font-weight: 700; color: #1a1205;
+    background: var(--amber); border-radius: 4px; padding: 1px 6px; margin-right: 8px;
+    text-transform: uppercase; letter-spacing: .03em; vertical-align: middle;
+  }
+  .toolcall { background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px; padding: 8px; margin: 8px 0; font-size: 12px; }
+  .toolcall .name { color: var(--purple); font-weight: 600; font-family: ui-monospace, monospace; }
+  /* 被调用的 MCP 工具高亮 */
+  .toolcall.mcp { background: #221833; border: 1px solid var(--purple); box-shadow: 0 0 0 1px rgba(163,113,247,0.25) inset; }
+  .toolcall.mcp .mcp-label {
+    display: inline-block; font-size: 10px; font-weight: 700; color: #fff;
+    background: var(--purple); border-radius: 4px; padding: 1px 6px; margin-right: 4px;
+  }
+  .ev-tag.mcp { color: #fff; background: var(--purple); border-color: var(--purple); font-weight: 600; }
+  /* 会话统计里的 MCP 工具清单 */
+  .tool-list { margin-top: 10px; font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .tool-list b { color: var(--text); }
+  .tool-chip {
+    font-family: ui-monospace, monospace; font-size: 11px; color: #d7c4ff;
+    background: #221833; border: 1px solid var(--purple); border-radius: 10px; padding: 2px 8px;
+  }
+  /* 翻译按钮状态 */
+  .icon-btn.js-translate.ok { color: var(--amber); border-color: var(--amber); }
+  .icon-btn.js-translate.busy { color: var(--amber); border-color: var(--amber); cursor: default; }
+  pre.raw {
+    background: #0b0d12; border: 1px solid var(--border); border-radius: 6px;
+    padding: 10px; font-size: 11px; overflow-x: auto; color: #c9d1d9;
+    max-height: 360px; overflow-y: auto; margin: 8px 0 0;
+  }
+  .raw-toggle { font-size: 11px; color: var(--accent); cursor: pointer; user-select: none; }
+  details summary { cursor: pointer; font-size: 12px; color: var(--accent); margin-top: 6px; }
+
+  /* type color accents */
+  .t-UTTERANCE .ev-type { color: var(--cyan); }
+  .t-ORCHESTRATION_MESSAGE .ev-type { color: var(--green); }
+  .t-AGENTIC_MESSAGE .ev-type { color: var(--purple); }
+  .t-LARGE_LANGUAGE_MODEL_INVOCATION .ev-type { color: var(--purple); }
+  .t-AI_AGENT_TRACE .ev-type { color: var(--amber); }
+  .t-CREATE_SESSION .ev-type, .t-SESSION_POLLED .ev-type { color: var(--muted); }
+  .t-GATEWAY .ev-type { color: var(--cyan); }
+  .t-GATEWAY { border-left: 3px solid var(--cyan); }
+
+  /* 角色徽标(客户/机器人/工具) */
+  .who { font-weight: 700; font-size: 10px; padding: 2px 8px; border-radius: 5px; white-space: nowrap; letter-spacing: .03em; }
+  .who.bot { background: rgba(79,140,255,.18); color: #8bb4ff; }
+  .who.customer { background: rgba(154,160,176,.20); color: #c3c8d6; }
+  .who.tool { background: rgba(192,132,252,.20); color: var(--purple); }
+
+  /* 按角色/严重度高亮整条事件卡片(参考 MEG_analysis 的行底色 + 左边框) */
+  .event.role-customer { border-left: 3px solid #9aa0b0; }
+  .event.role-bot { border-left: 3px solid var(--accent); }
+  .event.role-tool { border-left: 3px solid var(--purple); background: rgba(163,113,247,.07); }
+  .event.sev-guard { border-left: 3px solid var(--amber); background: rgba(210,153,34,.09); }
+  .event.sev-err  { border-left: 3px solid var(--red);   background: rgba(248,81,73,.09); }
+  .event.sev-barge { border-left: 3px solid var(--muted); background: rgba(139,148,158,.07); }
+  .ev-tag.barge { color: var(--muted); border-color: var(--muted); }
+
+  /* Guardrail 拦截原因单元格 */
+  .guard-reason { display: flex; align-items: baseline; gap: 4px; flex-wrap: wrap; line-height: 1.5; }
+  .guard-name { font-weight: 600; font-size: 12px; color: var(--fg); }
+  .guard-part { font-size: 11px; color: var(--muted); }
+  .guard-part::before { content: "· "; }
+  .guard-count { margin-left: auto; font-size: 11px; color: var(--amber); font-weight: 600; white-space: nowrap; }
+  .guard-reasons-wrap { display: flex; flex-direction: column; gap: 2px; }
+  .guard-reasons-wrap.collapsed .guard-reason:not(:first-child) { display: none; }
+  .guard-toggle { margin-top: 4px; font-size: 11px; color: var(--accent); background: none; border: none;
+    cursor: pointer; padding: 0; text-decoration: underline; }
+  .guard-toggle:hover { color: var(--fg); }
+
+  /* 图例 */
+  .legend { display: flex; flex-wrap: wrap; gap: 14px; align-items: center;
+    padding: 8px 16px; border-bottom: 1px solid var(--border); background: var(--panel);
+    font-size: 12px; color: var(--muted); }
+  .legend .item { display: flex; align-items: center; gap: 6px; }
+  .legend .sw { width: 14px; height: 14px; border-radius: 4px; display: inline-block; border: 1px solid var(--border); }
+
+  /* 数据源标签 */
+  .src-tag { font-size: 9px; padding: 1px 5px; border-radius: 3px; white-space: nowrap; font-weight: 600; }
+  .src-connect { background: #14283d; color: #6cb6ff; border: 1px solid #1f4a73; }
+  .src-gateway { background: #0f2e30; color: var(--cyan); border: 1px solid #1f5a5e; }
+
+  .stat-row { display: flex; gap: 18px; flex-wrap: wrap; font-size: 12px; color: var(--muted); }
+  .stat-row b { color: var(--text); }
+
+  /* ---- 顶部导航(Dashboard / 日志排查) ---- */
+  .nav { display: flex; gap: 6px; }
+  .nav-btn {
+    font-size: 13px; padding: 5px 14px; border-radius: 6px; cursor: pointer;
+    border: 1px solid var(--border); background: var(--panel-2); color: var(--muted);
+    transition: all 0.12s;
+  }
+  .nav-btn:hover { color: var(--text); border-color: var(--accent); }
+  .nav-btn.active { color: #fff; background: var(--accent); border-color: var(--accent); }
+
+  /* ---- 语言选择 ---- */
+  .lang-picker { margin-left: auto; display: flex; align-items: center; gap: 6px; }
+  .lang-picker label { font-size: 12px; color: var(--muted); white-space: nowrap; }
+  .lang-picker select {
+    padding: 5px 8px; background: var(--panel-2); border: 1px solid var(--border);
+    border-radius: 6px; color: var(--text); font-size: 12px; cursor: pointer;
+  }
+
+  /* ---- Dashboard 视图 ---- */
+  .dashboard { flex: 1; display: none; flex-direction: column; min-height: 0; overflow: hidden; padding: 20px 24px 4px; }
+  .dashboard.show { display: flex; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 14px; margin-bottom: 24px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px 16px;
+  }
+  .card .label { font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+  .card .value { font-size: 26px; font-weight: 700; color: var(--text); line-height: 1.1; }
+  .card .value.warn { color: var(--amber); }
+  .card .value.danger { color: var(--red); }
+  .card.accent { border-color: var(--accent); }
+
+  .tool-counts { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 24px; }
+  .tool-count-chip {
+    display: flex; align-items: center; gap: 8px; font-size: 12px;
+    background: #221833; border: 1px solid var(--purple); border-radius: 10px; padding: 6px 12px;
+  }
+  .tool-count-chip .tname { font-family: ui-monospace, monospace; color: #d7c4ff; }
+  .tool-count-chip .tnum { font-weight: 700; color: #fff; background: var(--purple); border-radius: 8px; padding: 1px 8px; }
+  .tool-counts-empty { font-size: 12px; color: var(--muted); }
+
+  /* Contact 列表表格 */
+  .table-scroll { flex: 1; overflow: auto; border: 1px solid var(--border); border-radius: 10px; min-height: 0; }
+  .contact-table { width: 100%; border-collapse: collapse; background: var(--panel); }
+  .contact-table th, .contact-table td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--border); font-size: 12px; white-space: nowrap; vertical-align: top; }
+  .contact-table thead th { position: sticky; top: 0; z-index: 1; }
+  /* 通话摘要列: 宽度较原来加宽 60% (min 200->320, max 320->512) */
+  .contact-table td.summary-cell { white-space: normal; min-width: 320px; max-width: 512px; }
+  /* 折叠态: 最多显示 3 行, 溢出隐藏; 展开态显示全部 */
+  .contact-table td.summary-cell .summary-text {
+    display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3;
+    overflow: hidden; word-break: break-word;
+  }
+  .contact-table td.summary-cell.expanded .summary-text {
+    display: block; -webkit-line-clamp: unset; overflow: visible;
+  }
+  .summary-toggle {
+    margin-top: 4px; padding: 0; background: none; border: none;
+    color: var(--accent); font-size: 11px; cursor: pointer;
+  }
+  .summary-toggle:hover { text-decoration: underline; }
+  .contact-table td.reason-cell { white-space: normal; min-width: 160px; max-width: 260px; }
+  .contact-table td.na { color: var(--muted); }
+  .num-good { color: var(--green); }
+  .num-warn { color: var(--amber); }
+  .num-bad { color: var(--red); }
+  .flag-yes { color: var(--amber); font-weight: 600; }
+  .contact-table th { color: var(--muted); font-weight: 600; background: var(--panel-2); font-size: 12px; }
+  .contact-table tr:last-child td { border-bottom: none; }
+  .contact-table tr:hover td { background: var(--panel-2); }
+  .contact-table .cid-cell { font-family: ui-monospace, monospace; color: var(--accent); word-break: break-all; }
+  .contact-table .cid-cell .cid-value { display: inline; }
+  .contact-table .cid-cell .cid-value.clickable { cursor: pointer; text-decoration: underline; text-decoration-style: dotted; text-underline-offset: 2px; }
+  .contact-table .cid-cell .cid-value.clickable:hover { color: #7fb8ff; }
+  .contact-table .cid-cell .js-copy-cid { margin-left: 6px; vertical-align: middle; }
+
+  /* ---- Contact 详情视图 (DescribeContact) ---- */
+  .contact-detail { flex: 1; overflow-y: auto; padding: 16px 24px; display: none; }
+  .contact-detail.show { display: block; }
+  .cd-toolbar { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; flex-wrap: wrap; }
+  .cd-toolbar .cd-label { font-size: 14px; font-weight: 600; color: var(--text); }
+  .cd-toolbar .cd-cid { font-family: ui-monospace, monospace; font-size: 12px; color: var(--accent); }
+  .cd-body { min-height: 0; }
+  .cd-status { font-size: 13px; color: var(--muted); margin: 10px 0; }
+  .cd-status.err { color: var(--red); }
+  .cd-fields { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; margin-bottom: 16px; }
+  .cd-fields th, .cd-fields td { text-align: left; padding: 8px 14px; border-bottom: 1px solid var(--border); font-size: 13px; vertical-align: top; }
+  .cd-fields th { color: var(--muted); font-weight: 600; width: 240px; white-space: nowrap; }
+  .cd-fields tr:last-child td, .cd-fields tr:last-child th { border-bottom: none; }
+  .cd-fields td { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--text); word-break: break-word; }
+  .cd-section-title { font-size: 13px; font-weight: 600; margin: 6px 0 8px; color: var(--text); }
+  pre.cd-json { background: #0b0d12; border: 1px solid var(--border); border-radius: 8px; padding: 12px; font-size: 12px; overflow-x: auto; color: #c9d1d9; max-height: 480px; overflow-y: auto; }
+  .contact-table .act-cell { white-space: nowrap; width: 1%; }
+  .act-btn {
+    font-size: 12px; padding: 5px 12px; margin-right: 6px; border-radius: 6px; cursor: pointer;
+    border: 1px solid var(--border); background: var(--panel-2); color: var(--text); transition: all 0.12s;
+  }
+  .act-btn:hover { border-color: var(--accent); }
+  .act-btn.stats:hover { border-color: var(--purple); color: #d7c4ff; }
+  .act-btn.stats.on { border-color: var(--purple); color: #fff; background: var(--purple); }
+  .act-btn.logs:hover { border-color: var(--accent); color: var(--accent); }
+
+  .contact-table .time-cell { color: var(--muted); font-size: 12px; white-space: nowrap; }
+  .contact-table .tools-cell { max-width: 320px; }
+  .contact-table .tools-cell .tool-chip { display: inline-block; margin: 2px 4px 2px 0; }
+  .contact-table tr.contact-row.expanded td { background: var(--panel-2); }
+  .contact-table tr.detail-row td { background: var(--panel-2); border-top: none; }
+  .contact-table tr.detail-row:hover td { background: var(--panel-2); }
+  .detail-cell { padding: 4px 14px 16px !important; }
+
+  /* ---- 分页组件 ---- */
+  .pagination {
+    display: flex; align-items: center; justify-content: flex-end;
+    gap: 10px; padding: 10px 4px; font-size: 12px; color: var(--muted);
+    flex-shrink: 0;
+  }
+  .pagination .page-info { white-space: nowrap; }
+  .pagination select {
+    padding: 4px 6px; background: var(--panel-2); border: 1px solid var(--border);
+    border-radius: 6px; color: var(--text); font-size: 12px; cursor: pointer;
+  }
+  .page-btn {
+    padding: 4px 12px; font-size: 12px; border-radius: 6px; cursor: pointer;
+    border: 1px solid var(--border); background: var(--panel-2); color: var(--text);
+    transition: all 0.12s; white-space: nowrap;
+  }
+  .page-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  .page-btn:disabled { opacity: .45; cursor: default; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+<!-- 防闪屏：登录完成前隐藏应用 UI，由 auth.js 的 bootApp() 在认证后取消隐藏 -->
+<style>body > header, #viewDashboard { display: none !important; }</style>
+</head>
+<body>
+<header>
+  <h1 data-i18n="appTitle">Connect AI Agent 日志排查</h1>
+  <nav class="nav">
+    <button class="nav-btn active" id="navDashboard" data-i18n="navDashboard">Dashboard</button>
+    <button class="nav-btn" id="navLog" data-i18n="navLog">日志排查</button>
+    <button class="nav-btn" id="navContact" data-i18n="navContact" style="display:none">Contact 详情</button>
+  </nav>
+  <span class="meta" id="globalMeta" data-i18n="metaLoading" style="display:none">加载中…</span>
+  <div class="lang-picker">
+    <label for="langSelect" data-i18n="langLabel">语言</label>
+    <select id="langSelect">
+      <option value="中文">中文</option>
+      <option value="English">English</option>
+      <option value="Español">Español</option>
+      <option value="Italiano">Italiano</option>
+      <option value="Deutsch">Deutsch</option>
+    </select>
+  </div>
+</header>
+
+<!-- Dashboard 视图 -->
+<div class="dashboard show" id="viewDashboard">
+  <!-- Loading 覆盖层：翻页/切换实例时显示 -->
+  <div id="dashLoading" style="display:none;position:fixed;inset:0;z-index:999;background:rgba(0,0,0,.35);align-items:center;justify-content:center;flex-direction:column;gap:12px">
+    <span style="width:36px;height:36px;border:3px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:spin .7s linear infinite;display:block"></span>
+    <span style="color:#fff;font-size:14px" data-i18n="metaLoading">加载中…</span>
+  </div>
+  <div class="table-scroll">
+    <table class="contact-table">
+      <thead>
+        <tr>
+          <th data-i18n="thChannel">Channel</th>
+          <th data-i18n="thLanguage">Language</th>
+          <th data-i18n="thDID">接电话的DID</th>
+          <th data-i18n="thContactId">Contact ID</th>
+          <th><span data-i18n="thSummary">Contact Summary</span> <button type="button" id="btnLoadAllSummaries" class="act-btn" data-i18n="btnLoadAllSummaries">Load All Summaries</button></th>
+          <th data-i18n="thStartTime">Start Time</th>
+          <th data-i18n="thEndTime">End Time</th>
+          <th data-i18n="thDuration">Call Duration</th>
+          <th data-i18n="thSysException">System Exception</th>
+          <th data-i18n="thFaqAsk">FAQ 提出次数</th>
+          <th data-i18n="thFaqSend">FAQ 发送次数</th>
+          <th data-i18n="thDisconnect">挂断方</th>
+          <th data-i18n="thSrIntent">创建 SR 意图触发次数</th>
+          <th data-i18n="thSrSuccess">SR Draft 创建成功次数</th>
+          <th data-i18n="thSrRate">SR Draft 创建成功率</th>
+          <th data-i18n="thSrNumber">SR工单号</th>
+          <th data-i18n="thSrRounds">SR 信息提取回答轮次</th>
+          <th data-i18n="thLatency">响应延迟</th>
+          <th data-i18n="thIntentAcc">意图识别准确率</th>
+          <th data-i18n="thInterrupt">用户打断次数</th>
+          <th data-i18n="thCsat">CSAT 满意度评分</th>
+          <th data-i18n="thAiCalls">调用 AI Agent 次数</th>
+          <th data-i18n="thMcpCalls">调用 MCP Tool 次数</th>
+          <th data-i18n="thEscFlag">触发转人工标志</th>
+          <th data-i18n="thEscReason">触发转人工原因</th>
+          <th data-i18n="thGuardCount">拦截次数</th>
+          <th data-i18n="thGuardReason">拦截原因</th>
+          <th data-i18n="thSilentTimeout">静默超时次数</th>
+          <th class="act-cell" data-i18n="thAction">Action</th>
+        </tr>
+      </thead>
+      <tbody id="dashContactRows"></tbody>
+    </table>
+  </div>
+  <div class="pagination">
+    <span class="page-info" id="pageInfo"></span>
+    <label for="pageSizeSelect" style="color:var(--muted);white-space:nowrap" data-i18n="pageSizeLabel">每页</label>
+    <select id="pageSizeSelect">
+      <option value="15" selected>15</option>
+      <option value="30">30</option>
+      <option value="50">50</option>
+      <option value="100">100</option>
+    </select>
+    <button class="page-btn" id="btnPagePrev" data-i18n="btnPrevPage">上一页</button>
+    <button class="page-btn" id="btnPageNext" data-i18n="btnNextPage">下一页</button>
+  </div>
+</div>
+
+<!-- 日志排查视图 -->
+<div class="layout" id="viewLog" style="display:none">
+  <aside class="sidebar">
+    <div class="search">
+      <input id="searchBox" type="text" data-i18n-ph="searchPlaceholder" placeholder="按 Contact ID 搜索…" autocomplete="off" />
+    </div>
+    <div class="contact-list" id="contactList"></div>
+  </aside>
+  <section class="main">
+    <div class="toolbar">
+      <span class="title" id="selectedTitle" data-i18n="noContactSelected">未选择会话</span>
+      <div class="filters" id="filters"></div>
+    </div>
+    <div class="legend">
+      <span class="item"><i class="sw" style="background:rgba(154,160,176,.5)"></i> <span data-i18n="legendCustomer">客户 (CUSTOMER)</span></span>
+      <span class="item"><i class="sw" style="background:rgba(79,140,255,.5)"></i> <span data-i18n="legendBot">机器人 (BOT)</span></span>
+      <span class="item"><i class="sw" style="background:rgba(192,132,252,.5)"></i> <span data-i18n="legendTool">工具调用 (MCP / TOOL)</span></span>
+      <span class="item"><i class="sw" style="background:rgba(210,153,34,.55)"></i> <span data-i18n="legendGuard">护栏 (Guardrail)</span></span>
+      <span class="item"><i class="sw" style="background:rgba(248,81,73,.55)"></i> <span data-i18n="legendError">错误 (Error)</span></span>
+    </div>
+    <div class="timeline" id="timeline">
+      <div class="empty" data-i18n="timelineEmpty">从左侧选择一个 Contact ID 查看会话时间线</div>
+    </div>
+  </section>
+</div>
+
+<!-- Contact 详情视图 (Amazon Connect DescribeContact API) -->
+<div class="contact-detail" id="viewContact" style="display:none">
+  <div class="cd-toolbar">
+    <span class="cd-label" data-i18n="cdHeading">DescribeContact 结果</span>
+    <span class="cd-cid" id="cdCid"></span>
+    <button class="act-btn" id="cdRefresh" data-i18n="cdRefresh">刷新</button>
+    <button class="act-btn" id="cdTranslate" data-i18n="cdTranslate" style="display:none">AI 翻译聊天记录</button>
+    <button class="act-btn" id="cdViewLogs" data-i18n="cdViewLogs" style="display:none">查看翻译结果</button>
+  </div>
+  <div class="cd-body" id="cdBody">
+    <div class="empty" data-i18n="cdEmpty">点击 Contact 列表中的某个 Contact ID 查看其 DescribeContact 结果</div>
+  </div>
+</div>
+
+<script src="./data.js"></script>
+<script src="./site-config.js"></script>
+<!-- 可选: Amazon Connect API 补充数据(通话摘要/挂断方/CSAT 等), 由 fetch-connect-contact-details.py 生成 -->
+<script src="./connect-enrich.js"></script>
+<script src="./i18n.js"></script>
+<script src="./app.js"></script>
+</body>
+</html>

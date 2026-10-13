@@ -1,0 +1,11 @@
+{
+    "email": "",
+    "hours": 8,
+    "connect": {
+        "uat-mis": {
+            "instance_arn": "",
+            "ai_log_arn": "",
+            "gateway_log_arn": ""
+        }
+    }
+}
