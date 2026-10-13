@@ -345,6 +345,20 @@
     border: 1px solid var(--border); background: var(--panel-2); color: var(--text); transition: all 0.12s;
   }
   .act-btn:hover { border-color: var(--accent); }
+  .act-btn:disabled { opacity: .45; cursor: default; }
+  .act-btn:disabled:hover { border-color: var(--border); }
+  .offline-badge {
+    font-size: 11px; padding: 2px 8px; margin-right: 12px; border-radius: 10px; cursor: help;
+    background: var(--panel-2); border: 1px solid var(--amber); color: var(--amber); white-space: nowrap;
+  }
+  .app-notice {
+    position: fixed; right: 16px; bottom: 16px; z-index: 1000; max-width: 380px; cursor: pointer;
+    font-size: 13px; padding: 10px 14px; border-radius: 8px; line-height: 1.5;
+    background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
+    box-shadow: 0 4px 16px rgba(0,0,0,.4);
+  }
+  .app-notice.warn { border-color: var(--amber); }
+  .app-notice.err { border-color: var(--red); }
   .act-btn.stats:hover { border-color: var(--purple); color: #d7c4ff; }
   .act-btn.stats.on { border-color: var(--purple); color: #fff; background: var(--purple); }
   .act-btn.logs:hover { border-color: var(--accent); color: var(--accent); }

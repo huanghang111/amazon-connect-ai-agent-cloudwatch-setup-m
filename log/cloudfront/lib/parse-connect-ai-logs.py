@@ -7,8 +7,9 @@ parse-connect-ai-logs.py
   2) Bedrock AgentCore Gateway 应用日志  (source = "gateway")
 
 输入(每路二选一格式，按扩展名/内容自动识别):
-  --connect FILE   Connect AI Agent 日志: filter-log-events 的 JSON，或控制台导出的 CSV
-  --gateway FILE   Bedrock AgentCore Gateway 日志: 同上(可选)
+  --connect FILE [FILE...]   Connect AI Agent 日志: filter-log-events 的 JSON，或 CSV
+                             (CSV 可为页面导出的多列格式; 带 source 列时以该列为准)
+  --gateway FILE [FILE...]   Bedrock AgentCore Gateway 日志: 同上(可选)
 
 输出:
   --out FILE       生成 data.js: window.__CONNECT_AI_LOG_DATA__ = [...]
@@ -140,19 +141,40 @@ def _load_events_json(path, source):
 
 
 def _load_csv(path, source):
+    """读取 CSV。按表头识别列:
+      - 多列(页面「下载 CSV」导出): timestamp_ms/timestamp, message, 可选 source;
+        datetime/event_type/原文/翻译 等派生或展示列忽略，前端会从 message 重新推导。
+      - 简单两列(timestamp,message): 表头无 message 列时按位置读取。
+    文件可带 UTF-8 BOM。
+    """
     rows = []
     csv.field_size_limit(min(sys.maxsize, 2 ** 31 - 1))
-    with open(path, "r", encoding="utf-8", newline="") as f:
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
         reader = csv.reader(f)
-        next(reader, None)  # 跳过表头 timestamp,message
+        header = [(h or "").strip().lower() for h in (next(reader, None) or [])]
+        ts_idx, msg_idx, src_idx = 0, 1, None
+        if "message" in header:
+            msg_idx = header.index("message")
+            for name in ("timestamp_ms", "timestamp"):
+                if name in header:
+                    ts_idx = header.index(name)
+                    break
+            if "source" in header:
+                src_idx = header.index("source")
+        need = max(ts_idx, msg_idx) + 1
         for rec in reader:
-            if not rec or len(rec) < 2:
+            if not rec or len(rec) < need:
                 continue
             try:
-                ts = int(rec[0])
+                ts = int(rec[ts_idx])
             except (ValueError, TypeError):
                 continue
-            rows.append({"timestamp": ts, "message": sanitize_message(rec[1]), "source": source})
+            row_source = source
+            if src_idx is not None and src_idx < len(rec):
+                s = rec[src_idx].strip().lower()
+                if s in ("connect", "gateway"):
+                    row_source = s
+            rows.append({"timestamp": ts, "message": sanitize_message(rec[msg_idx]), "source": row_source})
     return rows
 
 
@@ -165,6 +187,8 @@ def _extract_connect_ids(msg):
     try:
         o = json.loads(msg)
     except (ValueError, TypeError):
+        return contact_id, session_id
+    if not isinstance(o, dict):
         return contact_id, session_id
     session_id = o.get("session_id", "") or ""
     if o.get("session_name"):
@@ -234,13 +258,21 @@ def correlate(connect_rows, gateway_rows):
 # ---------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser(description="归一化并关联 Connect AI Agent + AgentCore Gateway 日志，生成 data.js")
-    ap.add_argument("--connect", required=True, help="Connect AI Agent 日志文件(filter-log-events JSON 或 CSV)")
-    ap.add_argument("--gateway", help="Bedrock AgentCore Gateway 日志文件(filter-log-events JSON 或 CSV)")
+    ap.add_argument("--connect", required=True, nargs="+",
+                    help="Connect AI Agent 日志文件(可多个; filter-log-events JSON 或 CSV, CSV 的 source 列优先)")
+    ap.add_argument("--gateway", nargs="+",
+                    help="Bedrock AgentCore Gateway 日志文件(可多个; filter-log-events JSON 或 CSV)")
     ap.add_argument("--out", required=True, help="输出的 data.js 路径")
     args = ap.parse_args()
 
-    connect_rows = load_any(args.connect, "connect")
-    gateway_rows = load_any(args.gateway, "gateway") if args.gateway else []
+    all_rows = []
+    for p in args.connect:
+        all_rows.extend(load_any(p, "connect"))
+    for p in (args.gateway or []):
+        all_rows.extend(load_any(p, "gateway"))
+    # CSV 带 source 列时以该列为准，所以按行里的 source 重新分流
+    connect_rows = [r for r in all_rows if r["source"] != "gateway"]
+    gateway_rows = [r for r in all_rows if r["source"] == "gateway"]
 
     correlate(connect_rows, gateway_rows)
 

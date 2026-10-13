@@ -321,6 +321,179 @@ def _repair_ticket_returned(sp):
 
 
 # ---------------------------------------------------------------------------
+# 转人工(Escalate)检测辅助函数（与前端 app.js detectEscalation 保持一致）
+# 只检查 Escalate 相关节点，绝不对 prompt 全文做 reason 正则。
+# ---------------------------------------------------------------------------
+
+def _try_parse(s):
+    """与前端 tryParse 一致: 非字符串原样返回；字符串解析失败返回 None。"""
+    if not isinstance(s, str):
+        return s
+    try:
+        return json.loads(s)
+    except (ValueError, TypeError):
+        return None
+
+
+def _is_escalate_tool(name):
+    return isinstance(name, str) and bool(_re.search(r'Escalate', name, _re.IGNORECASE))
+
+
+def _unescape_quotes(s):
+    """去掉引号前的转义反斜杠: \\"  \\\\\\"  \\'  ->  "  '"""
+    return _re.sub(r'\\+(["\'\\])', r'\1', s)
+
+
+def _reason_from_text(s):
+    """从文本里取 reason: 先认 Escalate(reason="...")，再认 "reason": "..." 键值形式。
+    只能用在已知属于 Escalate 调用或模型输出的文本上(不要扫 prompt)。"""
+    if not isinstance(s, str):
+        return ""
+    m = _re.search(r'\bEscalate\s*\(\s*reason\s*=\s*(\\*)(["\'])([\s\S]*?)\1\2\s*\)', s)
+    if m:
+        return _unescape_quotes(m.group(3))
+    m = _re.search(r'\breason\\*["\']?\s*[:=]\s*(\\*)(["\'])([\s\S]*?)\1\2', s)
+    if m:
+        return _unescape_quotes(m.group(3))
+    return ""
+
+
+def _reason_from_tool_input(inp):
+    """工具入参可能是 dict {reason: "..."}，也可能是 JSON 字符串。"""
+    if isinstance(inp, dict):
+        r = inp.get("reason")
+        return r if isinstance(r, str) else ""
+    if isinstance(inp, str):
+        o = _try_parse(inp)
+        if isinstance(o, dict) and isinstance(o.get("reason"), str):
+            return o["reason"]
+        return _reason_from_text(inp)
+    return ""
+
+
+def _reasons_from_tool_use_blocks(s):
+    """parsed_response 形如 ToolUseBlock(ToolUseId=..., Name=Escalate, Input="{\\"reason\\": \\"...\\"}")。"""
+    out = []
+    for m in _re.finditer(r'Name=([^,\s)]+),\s*Input="((?:[^"\\]|\\.)*)"', s):
+        if not _is_escalate_tool(m.group(1)):
+            continue
+        try:
+            inp = json.loads('"' + m.group(2) + '"')
+        except (ValueError, TypeError):
+            inp = m.group(2)
+        out.append(_reason_from_tool_input(inp))
+    return out
+
+
+def _detect_escalation(rows):
+    """检测 Contact 是否触发转人工并取原因，返回 (escalated: bool, reason: str)。
+
+    与前端 app.js::detectEscalation 对齐。来源: escalate_agent / execute_tool span
+    (含 input/output_messages 的 toolUse)、completion 的 toolUseList、parsed_response
+    的 ToolUseBlock、prompt 历史里的 Escalate toolUse。
+    同一次转人工会出现在多条事件里，原因按时间顺序去重后用 "; " 连接。
+    rows 需已按时间排序；gateway 行跳过；单个来源/单行异常不影响其它。
+    """
+    state = {"flag": False}
+    reasons = []
+
+    def add(r):
+        v = " ".join(str(r or "").split())
+        if not v:
+            return
+        state["flag"] = True
+        if v not in reasons:
+            reasons.append(v)
+
+    def from_span(obj):
+        span_str = obj.get("span")
+        if not span_str:
+            return
+        sp = _parse_span(span_str)
+        name = sp.get("span_name")
+        if name == "escalate_agent":
+            state["flag"] = True
+        if name != "execute_tool":
+            return
+        try:
+            if _is_escalate_tool(_tool_name_from_span(sp)):
+                state["flag"] = True
+        except Exception:
+            pass
+        for raw in (sp.get("input_messages"), sp.get("output_messages")):
+            if not raw:
+                continue
+            arr = _try_parse(raw)
+            if isinstance(arr, list):
+                for m in arr:
+                    vals = m.get("values") if isinstance(m, dict) else None
+                    if not isinstance(vals, list):
+                        continue
+                    for v in vals:
+                        tu = v.get("toolUse") if isinstance(v, dict) else None
+                        if isinstance(tu, dict) and _is_escalate_tool(tu.get("name")):
+                            add(_reason_from_tool_input(tu.get("input")))
+            elif isinstance(raw, str) and _re.search(r'Escalate', raw, _re.IGNORECASE):
+                add(_reason_from_text(raw))
+
+    def from_completion(obj):
+        comp = obj.get("completion")
+        if not comp:
+            return
+        c = _try_parse(comp)
+        if isinstance(c, (dict, list)):
+            tul = c.get("toolUseList") if isinstance(c, dict) else None
+            if isinstance(tul, list):
+                for tu in tul:
+                    if isinstance(tu, dict) and _is_escalate_tool(tu.get("toolName")):
+                        add(_reason_from_tool_input(tu.get("toolInput")))
+        elif isinstance(comp, str) and _re.search(r'Escalate', comp, _re.IGNORECASE):
+            add(_reason_from_text(comp))
+
+    def from_parsed_response(obj):
+        pr = obj.get("parsed_response")
+        if not isinstance(pr, str):
+            return
+        rs = _reasons_from_tool_use_blocks(pr)
+        for r in rs:
+            add(r)
+        if not rs and _re.search(r'\bEscalate\s*\(', pr):
+            add(_reason_from_text(pr))
+
+    def from_prompt(obj):
+        # 只看 messages[].content[] 里的 Escalate toolUse 节点，不扫 prompt 全文
+        if not obj.get("prompt"):
+            return
+        p = _try_parse(obj.get("prompt"))
+        if not isinstance(p, dict):
+            return
+        for msg in (p.get("messages") or []):
+            if not isinstance(msg, dict):
+                continue
+            for c in (msg.get("content") or []):
+                tu = c.get("toolUse") if isinstance(c, dict) else None
+                if isinstance(tu, dict) and _is_escalate_tool(tu.get("name")):
+                    state["flag"] = True
+                    add(_reason_from_tool_input(tu.get("input")))
+
+    for r in rows:
+        try:
+            if r.get("source") == "gateway":
+                continue
+            obj = json.loads(r["message"])
+            if not isinstance(obj, dict):
+                continue
+        except Exception:
+            continue
+        for scan in (from_span, from_completion, from_parsed_response, from_prompt):
+            try:
+                scan(obj)
+            except Exception:
+                continue
+    return state["flag"], "; ".join(reasons)
+
+
+# ---------------------------------------------------------------------------
 # 单 Contact 写入逻辑(线程池并发调用)
 # ---------------------------------------------------------------------------
 
@@ -473,38 +646,8 @@ def _write_contact(bucket, instance_name, cid, rows, instance_id="", connect_reg
                         rounds += 1
         sr_rounds = rounds
 
-    # 转人工检测
-    escalated = False
-    escalation_reason = ""
-    for r in rows:
-        if r.get("source") == "gateway":
-            continue
-        try:
-            obj = json.loads(r["message"])
-        except (ValueError, TypeError):
-            continue
-        span_str = obj.get("span", "")
-        if span_str:
-            sp = _parse_span(span_str)
-            if sp.get("span_name") == "escalate_agent":
-                escalated = True
-            if sp.get("span_name") == "execute_tool":
-                if _re.search(r'Escalate', _tool_name_from_span(sp) or "", _re.IGNORECASE):
-                    escalated = True
-        prompt_raw = obj.get("prompt", "")
-        if prompt_raw:
-            try:
-                prompt = json.loads(prompt_raw) if isinstance(prompt_raw, str) else prompt_raw
-                for pmsg in (prompt.get("messages") or []):
-                    for c in (pmsg.get("content") or []):
-                        if isinstance(c, dict) and c.get("toolUse"):
-                            tu = c["toolUse"]
-                            if _re.search(r'Escalate', tu.get("name", ""), _re.IGNORECASE):
-                                escalated = True
-                                if tu.get("input", {}).get("reason"):
-                                    escalation_reason = tu["input"]["reason"]
-            except (ValueError, TypeError):
-                pass
+    # 转人工检测: 多来源提取(与前端 app.js::detectEscalation 对齐)，见 _detect_escalation
+    escalated, escalation_reason = _detect_escalation(rows)
 
     ai_agent_calls = max(agentic, llm)
     response_latency = round(lat_sum / lat_n) if lat_n else None

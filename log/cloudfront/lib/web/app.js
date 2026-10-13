@@ -82,6 +82,165 @@
     if (typeof s !== "string") return s;
     try { return JSON.parse(s); } catch (e) { return null; }
   }
+  // ---- 本地 /api 后端可用性与统一请求封装 ----
+  // state: "unknown" | "online" | "offline"。仅针对本地 ./api/*(serve.py);
+  // CloudFront 部署不探测、不使用本地 API，状态永远保持 "unknown"。
+  const API = { state: "unknown", reason: "", probe: null, uiApplied: false };
+
+  function isCloudFrontMode() {
+    return !!window.__CF_TRANSLATE_CFG__ || typeof window.__CONNECT_DESCRIBE_CONTACT__ === "function";
+  }
+
+  // 永不 reject 的 fetch 封装: 网络错误 / 超时 / 非 2xx / 非 JSON / JSON 解析失败都归一成结果对象。
+  // 返回 { ok, status, data, error, kind }; kind 为 "" | "network" | "timeout" | "http" | "non-json"
+  async function apiFetch(url, opts) {
+    opts = opts || {};
+    const res = { ok: false, status: 0, data: null, error: "", kind: "" };
+    let timer = null;
+    let timedOut = false;
+    try {
+      const init = { method: opts.method || "GET" };
+      if (opts.headers) init.headers = opts.headers;
+      if (opts.body != null) init.body = opts.body;
+      if (typeof AbortController === "function") {
+        const ctrl = new AbortController();
+        init.signal = ctrl.signal;
+        timer = setTimeout(() => { timedOut = true; ctrl.abort(); }, opts.timeoutMs || 10000);
+      }
+      const resp = await fetch(url, init);
+      res.status = resp.status;
+      const text = await resp.text();
+      const ctype = (resp.headers && resp.headers.get("content-type")) || "";
+      const trimmed = text.trim();
+      let parsed = null;
+      let isJson = false;
+      if (/json/i.test(ctype) || trimmed.charAt(0) === "{" || trimmed.charAt(0) === "[") {
+        try { parsed = JSON.parse(trimmed); isJson = true; } catch (e) { isJson = false; }
+      }
+      if (!isJson) {
+        res.kind = "non-json";
+        res.error = resp.ok ? t("apiErrNonJson") : "HTTP " + resp.status;
+        return res;
+      }
+      res.data = parsed;
+      if (resp.ok) {
+        res.ok = true;
+      } else {
+        res.kind = "http";
+        res.error = String((parsed && parsed.error) || ("HTTP " + resp.status));
+      }
+      return res;
+    } catch (err) {
+      res.kind = timedOut ? "timeout" : "network";
+      res.error = timedOut ? t("apiErrTimeout") : t("apiErrNetwork");
+      return res;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  // 失败是否意味着"后端根本不存在/不可达"(而不是存活服务器返回的业务错误)
+  function isApiUnavailable(res) {
+    if (!res || res.ok) return false;
+    if (res.kind === "network" || res.kind === "timeout" || res.kind === "non-json") return true;
+    return [404, 405, 501, 502, 503, 504].indexOf(res.status) >= 0;
+  }
+
+  // 非阻塞提示(替代 alert): 同一时刻只保留一条, 6 秒后自动消失, 点击可关闭
+  let noticeTimer = null;
+  function showNotice(msg, kind) {
+    let el = document.getElementById("appNotice");
+    if (!el) {
+      el = document.createElement("div");
+      el.id = "appNotice";
+      el.setAttribute("role", "status");
+      el.setAttribute("aria-live", "polite");
+      el.addEventListener("click", () => el.remove());
+      document.body.appendChild(el);
+    }
+    el.className = "app-notice " + (kind === "err" ? "err" : "warn");
+    el.textContent = msg;
+    clearTimeout(noticeTimer);
+    noticeTimer = setTimeout(() => {
+      const cur = document.getElementById("appNotice");
+      if (cur) cur.remove();
+    }, 6000);
+  }
+
+  // 离线模式下的静态 UI: 顶部徽标 + 禁用「刷新」+ 隐藏「加载全部摘要」。幂等, 可在切换语言时重复调用。
+  function refreshOfflineUi() {
+    const off = API.state === "offline" && !isCloudFrontMode();
+    let badge = document.getElementById("offlineBadge");
+    const loadAll = document.getElementById("btnLoadAllSummaries");
+    if (off) {
+      if (!badge) {
+        badge = document.createElement("span");
+        badge.id = "offlineBadge";
+        badge.className = "offline-badge";
+        badge.setAttribute("tabindex", "0");
+        const meta = document.getElementById("globalMeta");
+        if (meta && meta.parentNode) meta.parentNode.insertBefore(badge, meta.nextSibling);
+        else document.body.insertBefore(badge, document.body.firstChild);
+      }
+      badge.textContent = t("offlineBadge");
+      badge.title = t("offlineBadgeTitle");
+      badge.setAttribute("aria-label", t("offlineBadge") + ": " + t("offlineBadgeTitle"));
+      if (cdRefreshBtn) { cdRefreshBtn.disabled = true; cdRefreshBtn.title = t("offlineFeatureTitle"); }
+      if (loadAll) loadAll.style.display = "none";
+      API.uiApplied = true;
+    } else if (API.uiApplied) {
+      if (badge) badge.remove();
+      if (cdRefreshBtn) { cdRefreshBtn.disabled = false; cdRefreshBtn.removeAttribute("title"); }
+      if (loadAll) loadAll.style.display = "";
+      API.uiApplied = false;
+    }
+  }
+
+  // 标记本地 API 不可用(幂等, 只会从非 offline 迁移一次, 之后不再产生任何请求)。
+  //   opts.initial: 首屏同步检测, 随后 init() 会渲染, 这里不重绘
+  //   opts.notify:  由按需操作(翻译)的失败触发时弹出非阻塞提示
+  function setApiOffline(reason, opts) {
+    opts = opts || {};
+    if (isCloudFrontMode() || API.state === "offline") return;
+    API.state = "offline";
+    API.reason = reason || "";
+    TRANSLATE_CFG.available = false;
+    refreshOfflineUi();
+    if (!opts.initial) {
+      renderSidebar(searchBox.value);
+      renderDashboard();
+      if (cdContactId) updateCdTranslateBtn(cdContactId);
+    }
+    if (opts.notify) showNotice(t("translateOffline"), "warn");
+    try { console.info("[offline] /api unavailable (" + (reason || "unknown") + "), running read-only"); } catch (e) { /* ignore */ }
+  }
+
+  // 探测本地 API 是否存在(只做一次, 结果缓存在 API.probe / API.state)。
+  // 优先级: CloudFront 模式跳过 > 构建脚本写入的 window.__API_AVAILABLE__ === false > file:// > 探测 ./api/config
+  function detectLocalApi() {
+    if (isCloudFrontMode()) return Promise.resolve(false);
+    if (API.probe) return API.probe;
+    if (window.__API_AVAILABLE__ === false || location.protocol === "file:") {
+      setApiOffline(window.__API_AVAILABLE__ === false ? "flag" : "file", { initial: true });
+      API.probe = Promise.resolve(false);
+      return API.probe;
+    }
+    API.probe = apiFetch("./api/config", { timeoutMs: 2500 }).then((res) => {
+      if (res.ok && res.data && typeof res.data === "object" && !Array.isArray(res.data)) {
+        API.state = "online";
+        TRANSLATE_CFG = { available: !!res.data.available, lang: res.data.lang || "中文", apiUrl: "" };
+        return true;
+      }
+      if (isApiUnavailable(res)) {
+        setApiOffline(res.kind === "http" ? "http-" + res.status : res.kind);
+        return false;
+      }
+      // 后端存在但 /api/config 报业务错误: 视为在线, 翻译按钮保持隐藏(与原行为一致)
+      API.state = "online";
+      return true;
+    }).catch(() => false);
+    return API.probe;
+  }
 
   // ---- 解析 span 字符串 "{k=v, k=v, nested=[...]}" ----
   // 这是 OpenTelemetry 风格的非 JSON 文本，做一个容错的浅解析。
@@ -193,6 +352,8 @@
   for (const e of events) {
     (groups[e.contactId] = groups[e.contactId] || []).push(e);
   }
+  // 本地模式: RAW 是完整事件行; CloudFront 模式: RAW 是摘要行(_summaryOnly)，与 init() 的判据一致
+  const LOCAL_RAW_MODE = RAW.length > 0 && !RAW[0]._summaryOnly;
   // 每个 Contact 的元信息(最早时间 / 事件数)，供侧栏排序使用
   let contactMeta = {};
   for (const cid of Object.keys(groups)) {
@@ -200,8 +361,26 @@
     let mn = Infinity;
     for (const x of list) { if (x.ts < mn) mn = x.ts; }
     contactMeta[cid] = { minTs: mn, count: list.length };
+    if (LOCAL_RAW_MODE) {
+      // 本地事件已全部在内存里，加载时直接算转人工标志与原因，首屏就能显示
+      try {
+        const esc = detectEscalation(list);
+        contactMeta[cid].escalated = esc.flag;
+        contactMeta[cid].escalationReason = esc.reason;
+      } catch (_) { /* 单个 contact 解析失败不影响其它 contact */ }
+    }
   }
   let contactIds = Object.keys(groups);
+
+  // 前端从事件里补全的转人工信息，按 contactId 保存，供 rebuildFromSummaries / 搜索结果合并回去
+  const escOverride = {};
+  function mergeEscOverride(cid, meta) {
+    const o = escOverride[cid];
+    if (!o || !meta) return;
+    if (o.escalated) meta.escalated = true;
+    // 只补空值，绝不覆盖非空的后端 reason
+    if (!meta.escalationReason && o.escalationReason) meta.escalationReason = o.escalationReason;
+  }
 
   // ---- 用新数据重建 groups / contactMeta / contactIds（切换实例时调用）----
   function rebuildFromSummaries(summaries) {
@@ -241,6 +420,7 @@
         csat:             s.csat != null ? s.csat : "",
         initiationMethod: s.initiationMethod || "",
       };
+      mergeEscOverride(cid, contactMeta[cid]);
     }
     contactIds = Object.keys(groups);
   }
@@ -551,27 +731,116 @@
     return { blocks, reasons };
   }
 
+  // ---- 转人工原因提取 ----
+  function isEscalateTool(name) {
+    return /Escalate/i.test(name || "");
+  }
+
+  // 去掉引号前的转义反斜杠: \"  \\\"  \'  ->  "  '
+  function unescapeQuotes(s) {
+    return s.replace(/\\+(["'\\])/g, "$1");
+  }
+
+  // 从文本里取 reason: 先认 Escalate(reason="...") / Escalate(reason=\"...\")，
+  // 再认 "reason": "..." / reason=\"...\" 这类键值形式。
+  // 只能用在已知属于 Escalate 调用或模型输出的文本上(不要扫 prompt)。
+  function reasonFromText(s) {
+    if (typeof s !== "string") return "";
+    let m = s.match(/\bEscalate\s*\(\s*reason\s*=\s*(\\*)(["'])([\s\S]*?)\1\2\s*\)/);
+    if (m) return unescapeQuotes(m[3]);
+    m = s.match(/\breason\\*["']?\s*[:=]\s*(\\*)(["'])([\s\S]*?)\1\2/);
+    if (m) return unescapeQuotes(m[3]);
+    return "";
+  }
+
+  // 工具入参可能是对象 {reason: "..."}，也可能是 JSON 字符串 "{\"reason\": \"...\"}"
+  function reasonFromToolInput(input) {
+    if (input && typeof input === "object") {
+      return typeof input.reason === "string" ? input.reason : "";
+    }
+    if (typeof input === "string") {
+      const o = tryParse(input);
+      if (o && typeof o === "object" && typeof o.reason === "string") return o.reason;
+      return reasonFromText(input);
+    }
+    return "";
+  }
+
+  // parsed_response 形如 ToolUseBlock(ToolUseId=..., Name=Escalate, Input="{\"reason\": \"...\"}")
+  function reasonsFromToolUseBlocks(s) {
+    const out = [];
+    const re = /Name=([^,\s)]+),\s*Input="((?:[^"\\]|\\.)*)"/g;
+    let m;
+    while ((m = re.exec(s))) {
+      if (!isEscalateTool(m[1])) continue;
+      let inp;
+      try { inp = JSON.parse('"' + m[2] + '"'); } catch (_) { inp = m[2]; }
+      out.push(reasonFromToolInput(inp));
+    }
+    return out;
+  }
+
   // 检测该会话是否触发转人工(Escalate 工具 / escalate_agent span)并取原因
+  // 同一次转人工会出现在多条事件里，原因按时间顺序去重后用 "; " 连接
   function detectEscalation(list) {
-    let flag = false, reason = "";
+    let flag = false;
+    const reasons = [];
+    const add = (r) => {
+      const v = (r || "").replace(/\s+/g, " ").trim();
+      if (!v) return;
+      flag = true;
+      if (!reasons.includes(v)) reasons.push(v);
+    };
     for (const e of list) {
       if (e.span && e.span.span_name === "escalate_agent") flag = true;
       if (e.span && e.span.span_name === "execute_tool") {
-        if (/Escalate/i.test(toolNameFromSpan(e.span) || "")) flag = true;
+        if (isEscalateTool(toolNameFromSpan(e.span))) flag = true;
+        // execute_tool span 的 input/output_messages 里带 toolUse.input
+        for (const raw of [e.span.input_messages, e.span.output_messages]) {
+          if (!raw) continue;
+          const arr = tryParse(raw);
+          if (Array.isArray(arr)) {
+            for (const m of arr) {
+              for (const v of ((m && m.values) || [])) {
+                if (v && v.toolUse && isEscalateTool(v.toolUse.name)) add(reasonFromToolInput(v.toolUse.input));
+              }
+            }
+          } else if (typeof raw === "string" && /Escalate/i.test(raw)) {
+            add(reasonFromText(raw));
+          }
+        }
       }
-      if (e.obj && e.obj.prompt) {
+      if (e.obj && e.obj.completion) {
+        // completion: {"toolUseList":[{"toolName":"Escalate","toolInput":"{\"reason\": ...}"}]} 或纯文本
+        const c = tryParse(e.obj.completion);
+        if (c && typeof c === "object") {
+          for (const tu of (c.toolUseList || [])) {
+            if (tu && isEscalateTool(tu.toolName)) add(reasonFromToolInput(tu.toolInput));
+          }
+        } else if (typeof e.obj.completion === "string" && /Escalate/i.test(e.obj.completion)) {
+          add(reasonFromText(e.obj.completion));
+        }
+      }
+      if (e.obj && typeof e.obj.parsed_response === "string") {
+        const pr = e.obj.parsed_response;
+        const rs = reasonsFromToolUseBlocks(pr);
+        rs.forEach(add);
+        if (!rs.length && /\bEscalate\s*\(/.test(pr)) add(reasonFromText(pr));
+      }
+      // 预检: prompt 是字符串且根本不含 Escalate 时，不可能有 Escalate toolUse，跳过整段 JSON 解析
+      if (e.obj && e.obj.prompt && (typeof e.obj.prompt !== "string" || /Escalate/i.test(e.obj.prompt))) {
         const p = tryParse(e.obj.prompt) || {};
         for (const msg of (p.messages || [])) {
           for (const c of (msg.content || [])) {
-            if (c.toolUse && /Escalate/i.test(c.toolUse.name || "")) {
+            if (c.toolUse && isEscalateTool(c.toolUse.name)) {
               flag = true;
-              if (c.toolUse.input && c.toolUse.input.reason) reason = c.toolUse.input.reason;
+              add(reasonFromToolInput(c.toolUse.input));
             }
           }
         }
       }
     }
-    return { flag: flag, reason: reason };
+    return { flag: flag, reason: reasons.join("; ") };
   }
 
   // ---- 把毫秒时长格式化为易读文本 ----
@@ -676,7 +945,7 @@
       if (trBtn) {
         trBtn.addEventListener("click", (ev) => {
           ev.stopPropagation();
-          translateContact(cid);
+          translateContact(cid).catch(() => {});
         });
       }
 
@@ -1152,6 +1421,7 @@
           // 把拉到的原始事件行解析成 app.js 可用的 event 对象，存入 groups
           if (!groups[cid] || groups[cid].length === 0) {
             groups[cid] = parseRawRows(rows);
+            applyEscalationFromEvents(cid);
           }
           if (activeCid === cid) renderTimeline(cid);
         })
@@ -1163,6 +1433,24 @@
     } else {
       renderTimeline(cid);
     }
+  }
+
+  // 事件明细加载后，用前端更完整的提取结果补全 contactMeta 里的转人工信息
+  function applyEscalationFromEvents(cid) {
+    const list = groups[cid];
+    const meta = contactMeta[cid];
+    if (!meta || !list || !list.length) return false;
+    let esc;
+    try { esc = detectEscalation(list); } catch (_) { return false; }
+    let changed = false;
+    if (esc.flag && !meta.escalated) { meta.escalated = true; changed = true; }
+    // 只补空值，绝不覆盖非空的后端 reason
+    if (esc.reason && !meta.escalationReason) { meta.escalationReason = esc.reason; changed = true; }
+    if (changed) {
+      escOverride[cid] = { escalated: !!meta.escalated, escalationReason: meta.escalationReason || "" };
+      try { renderDashboard(); } catch (_) { /* 重绘失败不影响日志视图 */ }
+    }
+    return changed;
   }
 
   // ---- 把从 API 拉回的原始事件行解析成 app.js 内部 event 对象 ----
@@ -1221,6 +1509,11 @@
       if (activeCid === cid) renderTimeline(cid);
       return;
     }
+    // 本地模式且已确认没有 /api: 不发请求, 保留原文
+    if (!isCloudFrontMode() && API.state === "offline") {
+      showNotice(t("translateOffline"), "warn");
+      return;
+    }
     translatingContacts.add(cid);
     renderSidebar(searchBox.value);
     try {
@@ -1228,26 +1521,35 @@
       const translateUrl = (TRANSLATE_CFG.apiUrl)
         ? TRANSLATE_CFG.apiUrl + "/translate"
         : "./api/translate";
-      const resp = await fetch(translateUrl, {
+      const res = await apiFetch(translateUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ texts: items.map((i) => i.text), lang: TRANSLATE_CFG.lang }),
+        timeoutMs: 60000,
       });
-      const data = await resp.json().catch(() => ({}));
-      if (!resp.ok) throw new Error((data && data.error) || ("HTTP " + resp.status));
-      const translations = data.translations || [];
-      items.forEach((it, i) => {
-        it.e.translation = translations[i] || "";
-        it.e.translationLang = data.lang || TRANSLATE_CFG.lang;
-      });
-      translatedContacts.add(cid);
+      const data = res.data;
+      if (res.ok && data && Array.isArray(data.translations)) {
+        items.forEach((it, i) => {
+          it.e.translation = data.translations[i] || "";
+          it.e.translationLang = data.lang || TRANSLATE_CFG.lang;
+        });
+        translatedContacts.add(cid);
+      } else if (!res.ok && !isCloudFrontMode() && !TRANSLATE_CFG.apiUrl && isApiUnavailable(res)) {
+        // 本地后端不存在/不可达: 切到离线模式(此后不再请求), 原文保持不变
+        setApiOffline(res.kind === "http" ? "http-" + res.status : res.kind, { notify: true });
+      } else {
+        // 翻译失败: 不写入 translation, 页面继续只显示原文
+        showNotice(t("translateFailed") + (res.error || t("apiErrNonJson")), "err");
+      }
     } catch (err) {
-      window.alert(t("translateFailed") + (err && err.message ? err.message : err));
+      showNotice(t("translateFailed") + (err && err.message ? err.message : String(err)), "err");
     } finally {
       translatingContacts.delete(cid);
-      renderSidebar(searchBox.value);
-      if (activeCid === cid) renderTimeline(cid);
-      if (cdContactId === cid) updateCdTranslateBtn(cid);
+      try {
+        renderSidebar(searchBox.value);
+        if (activeCid === cid) renderTimeline(cid);
+        if (cdContactId === cid) updateCdTranslateBtn(cid);
+      } catch (e) { /* 渲染失败不应产生未处理的 rejection */ }
     }
   }
 
@@ -1262,13 +1564,8 @@
       };
       return Promise.resolve();
     }
-    // 本地 serve.py 版: 探测 ./api/config
-    return fetch("./api/config")
-      .then((r) => (r.ok ? r.json() : null))
-      .then((cfg) => {
-        if (cfg) TRANSLATE_CFG = { available: !!cfg.available, lang: cfg.lang || "中文", apiUrl: "" };
-      })
-      .catch(() => { /* 非翻译服务器(如 file:// 或 http.server) -> 隐藏翻译按钮 */ });
+    // 本地 serve.py 版: 探测 ./api/config(结果缓存; 非翻译服务器如 file:// 或 http.server -> 隐藏翻译按钮)
+    return detectLocalApi().then(() => {}, () => {});
   }
 
   // ---- 渲染 Dashboard ----
@@ -1376,7 +1673,7 @@
         cell(meta.did || "", "did-cell") +
         `<td class="cid-cell"><span class="cid-value clickable" title="${esc(t("cdOpenTitle"))}">${esc(cid)}</span>` +
           `<button class="icon-btn js-copy-cid" title="${esc(t("titleCopy"))}">⧉</button></td>` +
-        summaryCellHtml() +
+        summaryCellHtml(cid) +
         `<td class="time-cell">${esc(formatDateTime(minTs))}</td>` +
         `<td class="time-cell">${esc(formatDateTime(maxTs))}</td>` +
         `<td class="time-cell">${esc(formatDuration(duration))}</td>` +
@@ -1456,7 +1753,16 @@
   }
 
   // 通话摘要列: 初始渲染为「加载」按钮，点击后才请求接口拉取并替换为可折叠文字
-  function summaryCellHtml() {
+  function summaryCellHtml(cid) {
+    // 离线模式(无 /api 且无 CloudFront 钩子): 「加载摘要」按钮不会起作用, 改为预抓取缓存文本或 N/A
+    if (API.state === "offline" && typeof window.__CONNECT_DESCRIBE_CONTACT__ !== "function") {
+      const cached = ((ENRICH[cid] || {}).summary) || "";
+      if (cached) {
+        return `<td class="summary-cell"><div class="summary-text">${esc(cached)}</div>` +
+          `<button type="button" class="summary-toggle" style="display:none">${esc(t("expand"))}</button></td>`;
+      }
+      return `<td class="summary-cell na">${esc(t("na"))}</td>`;
+    }
     return `<td class="summary-cell"><button type="button" class="act-btn summary-load-btn">${esc(t("btnLoadSummary"))}</button></td>`;
   }
 
@@ -1581,7 +1887,7 @@
     navContact.style.display = "";
     cdCidEl.textContent = cid;
     showView("contact");
-    loadDescribeContact(cid);
+    loadDescribeContact(cid).catch(() => {});
     updateCdTranslateBtn(cid);
   }
 
@@ -1643,25 +1949,41 @@
       }
     }
 
-    // 2) 本地 serve.py: /api/describe-contact 端点
+    // 2) 本地 serve.py: /api/describe-contact 端点(无 /api 时直接回退, 不发请求)
+    const cached = (ENRICH[cid] || {}).describeContact;
+    const showOffline = () => {
+      if (cached) {
+        renderDescribeContact(cid, cached.Contact || cached, "cache");
+        return;
+      }
+      cdBodyEl.innerHTML =
+        `<div class="cd-status">${esc(t("cdOffline"))}</div>` +
+        `<div class="cd-status">${esc(t("cdOfflineHint"))}</div>`;
+    };
     try {
+      await detectLocalApi();
+      if (API.state === "offline") { showOffline(); return; }
       const qs = "contactId=" + encodeURIComponent(cid) +
         (instanceId ? "&instanceId=" + encodeURIComponent(instanceId) : "");
-      const resp = await fetch("./api/describe-contact?" + qs);
-      const data = await resp.json().catch(() => ({}));
-      if (resp.ok && data && data.Contact) {
+      const res = await apiFetch("./api/describe-contact?" + qs, { timeoutMs: 15000 });
+      const data = res.data;
+      if (res.ok && data && data.Contact) {
         renderDescribeContact(cid, data.Contact, "api");
         return;
       }
-      if (resp.ok && data && !data.Contact && !data.error) {
+      if (res.ok && data && !data.Contact && !data.error) {
         // 有的 API 直接返回 Contact 字段在顶层
         renderDescribeContact(cid, data, "api");
         return;
       }
-      throw new Error((data && data.error) || ("HTTP " + resp.status));
+      if (isApiUnavailable(res)) {
+        setApiOffline(res.kind === "http" ? "http-" + res.status : res.kind);
+        showOffline();
+        return;
+      }
+      throw new Error((data && data.error) || res.error || ("HTTP " + res.status));
     } catch (err) {
       // 回退: enrich 缓存
-      const cached = (ENRICH[cid] || {}).describeContact;
       if (cached) {
         renderDescribeContact(cid, cached.Contact || cached, "cache");
         return;
@@ -1777,6 +2099,7 @@
     try { localStorage.setItem("connectAiUiLang", lang); } catch (e) { /* 忽略 */ }
     applyStaticI18n();
     updateGlobalMeta();
+    refreshOfflineUi();
     renderSidebar(searchBox.value);
     renderDashboard();
     // selectedTitle 在选中会话后显示 Contact ID，未选中时显示占位文案
@@ -1803,6 +2126,8 @@
 
     applyStaticI18n();
     updateGlobalMeta();
+    // 同步确定 /api 是否可用(构建脚本写入的标记 / file://), 让首屏就是正确状态; 否则异步探测一次
+    try { detectLocalApi().catch(() => {}); } catch (e) { /* 探测失败不影响渲染 */ }
     // 语言下拉框
     const langSelect = document.getElementById("langSelect");
     if (langSelect) {
@@ -1863,7 +2188,7 @@
               const cid = s.contactId;
               if (!cid) continue;
               _searchGroups[cid] = groups[cid] || [];
-              _searchContactMeta[cid] = contactMeta[cid] || {
+              const m = contactMeta[cid] || {
                 minTs: s.minTs || 0, count: s.count || 0, maxTs: s.maxTs || 0,
                 sourceCounts: s.sourceCounts || {}, locale: s.locale || "",
                 bu: s.bu || "", mcpToolCalls: s.mcpToolCalls || 0,
@@ -1875,6 +2200,8 @@
                 responseLatency: s.responseLatency != null ? s.responseLatency : null,
                 escalated: s.escalated || false, escalationReason: s.escalationReason || "",
               };
+              mergeEscOverride(cid, m);
+              _searchContactMeta[cid] = m;
             }
             _searchContactIds = Object.keys(_searchGroups);
             renderSidebarSearch();
@@ -1903,6 +2230,7 @@
           ? window.__CONNECT_LOAD_CONTACT_EVENTS__(cdContactId).then((rows) => {
               if (!groups[cdContactId] || groups[cdContactId].length === 0) {
                 groups[cdContactId] = parseRawRows(rows);
+                applyEscalationFromEvents(cdContactId);
               }
             })
           : Promise.resolve();
@@ -2038,12 +2366,14 @@
     // 用户从 Dashboard 点击「日志」按钮时再按需加载
     // 探测翻译能力，成功后重绘侧栏以显示翻译按钮
     loadTranslateConfig().then(() => {
+      refreshOfflineUi();
       renderSidebar(searchBox.value);
       if (cdContactId) updateCdTranslateBtn(cdContactId);
-    });
+    }).catch(() => {});
 
     // 切换实例时由 auth.js 调用，传入新实例的摘要列表，重建数据并刷新所有视图
     window.__CONNECT_SWITCH_INSTANCE__ = function (instanceName, summaries, nextToken, totalContacts) {
+      for (const k of Object.keys(escOverride)) delete escOverride[k];
       rebuildFromSummaries(summaries);
       activeCid = null;
       dashPage = 1;
