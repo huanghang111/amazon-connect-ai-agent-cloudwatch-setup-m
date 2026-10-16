@@ -69,6 +69,7 @@ WEB_DIR = os.path.join(LIB_DIR, "web")
 WEB_CF_DIR = os.path.join(LIB_DIR, "web-cloudfront")
 FETCHER = os.path.join(LIB_DIR, "fetch-to-s3.py")
 LAMBDA_HANDLER = os.path.join(LIB_DIR, "lambda", "handler.py")
+CONTACT_SUMMARY = os.path.join(LIB_DIR, "lambda", "contact_summary.py")
 QUERY_HANDLER = os.path.join(LIB_DIR, "lambda", "query_handler.py")
 PARSER_MODULE = os.path.join(LIB_DIR, "parse-connect-ai-logs.py")
 
@@ -189,6 +190,14 @@ def lambda_function_exists(lam, name):
         return False
 
 
+def _build_splitter_zip(zip_path):
+    """Build the splitter Lambda package with its two local modules."""
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.write(LAMBDA_HANDLER, "handler.py")
+        zf.write(PARSER_MODULE, "connect_parser.py")
+        zf.write(CONTACT_SUMMARY, "contact_summary.py")
+
+
 # ---------------------------------------------------------------------------
 # 参数解析
 # ---------------------------------------------------------------------------
@@ -224,6 +233,7 @@ def main():
     for f, label in [
         (FETCHER, "lib/fetch-to-s3.py"),
         (LAMBDA_HANDLER, "lib/lambda/handler.py"),
+        (CONTACT_SUMMARY, "lib/lambda/contact_summary.py"),
         (PARSER_MODULE, "lib/parse-connect-ai-logs.py"),
         (os.path.join(WEB_CF_DIR, "auth.js"), "lib/web-cloudfront/auth.js"),
     ]:
@@ -598,11 +608,9 @@ def main():
         PolicyDocument=json.dumps(lambda_policy),
     )
 
-    # 打包 Lambda 部署包(handler.py + connect_parser.py)
+    # 打包 Lambda 部署包(handler.py + connect_parser.py + contact_summary.py)
     lambda_zip_path = os.path.join(work, "lambda.zip")
-    with zipfile.ZipFile(lambda_zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.write(LAMBDA_HANDLER, "handler.py")
-        zf.write(PARSER_MODULE, "connect_parser.py")
+    _build_splitter_zip(lambda_zip_path)
     with open(lambda_zip_path, "rb") as f:
         lambda_zip_bytes = f.read()
 
