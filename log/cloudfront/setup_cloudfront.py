@@ -11,12 +11,18 @@ setup_cloudfront.py
     1) 从 config.json 读取所有 Connect 实例配置（email、hours、每个实例的 ARN）。
     2) 创建共享基础设施（一次性）：日志桶、DynamoDB 两张表、Lambda（解析函数）、
        Cognito 用户池/身份池/鉴权角色、CloudFront 分配。
+       解析/查询/事件解析三个 Lambda 共用一个执行角色
+       connect-ai-logs-<account>-lambda-role(每个 Lambda 一份内联策略)。
     3) 对每个实例循环执行：
          a. 查询实例的 InstanceAlias 作为 instanceName（DynamoDB 分区键）。
          b. 把 AI Agent 日志与 Gateway 日志直传到日志桶的 raw/<inst-key>/ 前缀。
          c. 写 trigger/<inst-key>.json（含 instanceName、connect/gateway S3 key、prefix）。
          d. S3 事件触发 Lambda 在云端解析，按 instanceName 写入 DynamoDB。
          e. 等待 Lambda 生成 <prefix>index.json 完成。
+         f. 每个新写入的 events/<instanceName>/<contactId>.json.gz 由 S3 事件触发
+            事件解析 Lambda(connect-ai-logs-<account>-process-events)，
+            解析 faqSearch 调用并附带 Contact 渠道/属性，
+            结果输出到该函数的 CloudWatch 日志(拉取日志前完成部署)。
     4) 把 Web 应用发布到独立 S3 桶并通过 CloudFront(OAC) 对外提供。
        登录成功后用 Cognito Identity Pool 换取临时凭证，从 DynamoDB 按
        instanceName 加载 Contact 摘要列表。
@@ -72,6 +78,21 @@ LAMBDA_HANDLER = os.path.join(LIB_DIR, "lambda", "handler.py")
 CONTACT_SUMMARY = os.path.join(LIB_DIR, "lambda", "contact_summary.py")
 QUERY_HANDLER = os.path.join(LIB_DIR, "lambda", "query_handler.py")
 PARSER_MODULE = os.path.join(LIB_DIR, "parse-connect-ai-logs.py")
+# 事件解析 Lambda(connect-ai-logs-<account>-process-events): 入口(内置会话解析) + contact_summary(部署时打包)
+PROCESS_EVENTS_HANDLER = os.path.join(LIB_DIR, "lambda", "process_events_logs.py")
+# 日志桶事件通知 Id 与 S3 调用权限 StatementId(与 process-raw-logs / s3invoke 对应)
+PROCESS_EVENTS_NOTIFICATION_ID = "process-events-logs"
+PROCESS_EVENTS_STATEMENT_ID = "s3invoke-events"
+PROCESS_EVENTS_LOG_RETENTION_DAYS = 30
+PROCESS_EVENTS_CONCURRENCY = 5
+# IAM 角色所有内联策略合计字符数上限(不计空白)。三个 Lambda 共用
+# connect-ai-logs-<account>-lambda-role，三份内联策略合计(紧凑 JSON):
+# 1 实例 ≈ 2,219；10 实例 ≈ 3,929；40 实例 ≈ 9,629；约 44 个实例(每实例一个
+# amazon-connect-<12hex> 录音桶；录音桶名 63 字符时约 32 个)才会超限，由
+# check_lambda_role_policy_budget() 在写入前校验。
+IAM_ROLE_INLINE_POLICY_LIMIT = 10240
+# 旧版本为查询/事件解析 Lambda 单独创建的角色(本脚本不再使用，也不自动删除)
+LEGACY_LAMBDA_ROLE_SUFFIXES = ("query-role", "process-events-role")
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +220,561 @@ def _build_splitter_zip(zip_path):
 
 
 # ---------------------------------------------------------------------------
+# S3 桶事件通知: 按 Id 合并(put_bucket_notification_configuration 会整体替换)
+# ---------------------------------------------------------------------------
+
+
+def _filter_rules_key(lambda_cfg):
+    """把通知配置的过滤规则标准化(Name 大小写不敏感: GET 返回 Prefix，PUT 用 prefix)。"""
+    rules = ((lambda_cfg.get("Filter") or {}).get("Key") or {}).get("FilterRules") or []
+    return tuple(
+        sorted((str(r.get("Name", "")).lower(), r.get("Value", "")) for r in rules)
+    )
+
+
+def merge_lambda_notification(existing, entry):
+    """把一条 Lambda 通知合并进现有桶通知配置，返回新配置(不修改入参)。
+
+    - 保留 Topic/Queue/EventBridge 等其它配置与其它 Lambda 配置；
+    - 去掉 Id 相同的旧条目，或 LambdaFunctionArn 与过滤规则都相同的旧条目(避免重复)；
+    - 追加 entry。
+    """
+    merged = {k: v for k, v in (existing or {}).items() if k != "ResponseMetadata"}
+    entry_rules = _filter_rules_key(entry)
+    kept = [
+        c
+        for c in merged.get("LambdaFunctionConfigurations") or []
+        if not (
+            c.get("Id") == entry["Id"]
+            or (
+                c.get("LambdaFunctionArn") == entry["LambdaFunctionArn"]
+                and _filter_rules_key(c) == entry_rules
+            )
+        )
+    ]
+    merged["LambdaFunctionConfigurations"] = kept + [entry]
+    return merged
+
+
+def lambda_has_permission(lam, function, statement_id):
+    """函数存在且 resource policy 含指定 StatementId 时返回 True。
+
+    仅当 get_policy 返回 ResourceNotFoundException(函数不存在或无 resource policy)
+    时判为 False；限流、AccessDenied 等其它错误无法确定状态，按"有权限"处理，
+    避免误删健康的通知条目。
+    """
+    try:
+        policy = json.loads(lam.get_policy(FunctionName=function).get("Policy") or "{}")
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "ResourceNotFoundException":
+            return False
+        print(
+            f"    警告: 检查 {function} 权限失败({e})，保留其通知条目",
+            file=sys.stderr,
+        )
+        return True
+    return any(s.get("Sid") == statement_id for s in policy.get("Statement") or [])
+
+
+def process_events_entry_valid(lam, cfg):
+    """现有通知条目是否可原样保留。
+
+    S3 写入通知时会校验所有 Lambda 目标；若事件解析 Lambda 或其 s3invoke-events
+    权限被手工删除，旧的 process-events-logs 条目会让整次写入失败。这里把它判为
+    无效以便丢弃(随后的事件解析 Lambda 部署步骤会重新写入)。其它条目一律保留。
+    """
+    if cfg.get("Id") != PROCESS_EVENTS_NOTIFICATION_ID:
+        return True
+    return lambda_has_permission(
+        lam, cfg.get("LambdaFunctionArn", ""), PROCESS_EVENTS_STATEMENT_ID
+    )
+
+
+def put_lambda_notification(s3, bucket, entry, sleep=time.sleep, keep=None):
+    """读取 -> 合并 -> 写回桶事件通知。
+
+    keep: 可选，判断现有 Lambda 通知条目是否保留的函数；返回 False 的条目会被丢弃。
+    S3 会验证 Lambda resource policy，权限刚写入时可能尚未传播，重试最多 6 次。
+    """
+    existing = s3.get_bucket_notification_configuration(Bucket=bucket)
+    if keep is not None:
+        existing = dict(existing or {})
+        kept = []
+        for c in existing.get("LambdaFunctionConfigurations") or []:
+            if keep(c):
+                kept.append(c)
+            else:
+                print(f"    丢弃失效的桶事件通知: {c.get('Id')} -> {c.get('LambdaFunctionArn')}")
+        existing["LambdaFunctionConfigurations"] = kept
+    merged = merge_lambda_notification(existing, entry)
+    for attempt in range(1, 7):
+        try:
+            s3.put_bucket_notification_configuration(
+                Bucket=bucket,
+                NotificationConfiguration=merged,
+            )
+            return merged
+        except ClientError as e:
+            if attempt >= 6:
+                print(f"错误: 配置桶事件通知失败: {e}", file=sys.stderr)
+                raise
+            print(f"    Lambda 权限尚未传播，重试 ({attempt}/6)，等待 10s ...")
+            sleep(10)
+
+
+# ---------------------------------------------------------------------------
+# 事件解析 Lambda: connect-ai-logs-<account>-process-events(监听 events/*.json.gz)
+# ---------------------------------------------------------------------------
+
+
+def _build_process_events_zip(zip_path):
+    """打包事件解析 Lambda: 入口(含 AI Agent 会话解析) + contact_summary(均来自 lib/lambda)。"""
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.write(PROCESS_EVENTS_HANDLER, "process_events_logs.py")
+        zf.write(CONTACT_SUMMARY, "contact_summary.py")
+
+
+def build_process_events_policy(
+    region, account_id, logs_bucket, connect_arns, function_name
+):
+    """事件解析 Lambda 所需权限: 共用执行角色上的内联策略 events-read-and-contact。"""
+    log_group = f"/aws/lambda/{function_name}"
+    return {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": ["logs:CreateLogGroup"],
+                "Resource": f"arn:aws:logs:{region}:{account_id}:*",
+            },
+            {
+                "Effect": "Allow",
+                "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+                "Resource": f"arn:aws:logs:{region}:{account_id}:log-group:{log_group}:*",
+            },
+            {
+                "Effect": "Allow",
+                "Action": ["s3:GetObject"],
+                "Resource": [f"arn:aws:s3:::{logs_bucket}/events/*"],
+            },
+            {
+                "Effect": "Allow",
+                "Action": ["connect:DescribeContact", "connect:GetContactAttributes"],
+                "Resource": [f"{arn}/contact/*" for arn in connect_arns],
+            },
+        ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# 共用 Lambda 执行角色 connect-ai-logs-<account>-lambda-role
+# (解析/查询/事件解析三个 Lambda 共用；每个 Lambda 的权限是一份独立命名的内联策略)
+# ---------------------------------------------------------------------------
+
+
+def build_lambda_trust():
+    """Lambda 执行角色信任策略。"""
+    return {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Principal": {"Service": "lambda.amazonaws.com"},
+                "Action": "sts:AssumeRole",
+            }
+        ],
+    }
+
+
+def ensure_lambda_role(iam, role_name):
+    """幂等创建/更新共用 Lambda 执行角色(仅角色与信任策略)。返回 (role_arn, created)。"""
+    trust = json.dumps(build_lambda_trust())
+    if iam_role_exists(iam, role_name):
+        print(f"==> 复用 Lambda 执行角色(三个 Lambda 共用): {role_name}")
+        iam.update_assume_role_policy(RoleName=role_name, PolicyDocument=trust)
+        return iam.get_role(RoleName=role_name)["Role"]["Arn"], False
+    print(f"==> 创建 Lambda 执行角色(三个 Lambda 共用): {role_name}")
+    arn = iam.create_role(RoleName=role_name, AssumeRolePolicyDocument=trust)["Role"][
+        "Arn"
+    ]
+    return arn, True
+
+
+def build_splitter_policy(region, account_id, logs_bucket, contacts_table):
+    """解析 Lambda 所需权限: 共用执行角色上的内联策略 logs-bucket-rw。"""
+    return {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": ["s3:GetObject", "s3:PutObject"],
+                "Resource": [f"arn:aws:s3:::{logs_bucket}/*"],
+            },
+            {
+                "Effect": "Allow",
+                "Action": [
+                    "logs:CreateLogGroup",
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents",
+                ],
+                "Resource": "arn:aws:logs:*:*:*",
+            },
+            {
+                "Effect": "Allow",
+                "Action": [
+                    "dynamodb:GetItem",
+                    "dynamodb:PutItem",
+                    "dynamodb:Scan",
+                    "dynamodb:UpdateItem",
+                ],
+                "Resource": [
+                    f"arn:aws:dynamodb:{region}:{account_id}:table/{contacts_table}",
+                ],
+            },
+            {
+                "Effect": "Allow",
+                "Action": ["connect:DescribeContact"],
+                "Resource": [f"arn:aws:connect:*:{account_id}:instance/*/contact/*"],
+            },
+        ],
+    }
+
+
+def build_query_policy(
+    region, account_id, logs_bucket, contacts_table, recordings_buckets
+):
+    """查询 Lambda 所需权限: 共用执行角色上的内联策略 ddb-read-and-logs。"""
+    return {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": [
+                    "logs:CreateLogGroup",
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents",
+                ],
+                "Resource": "arn:aws:logs:*:*:*",
+            },
+            {
+                "Effect": "Allow",
+                "Action": ["dynamodb:Query", "dynamodb:GetItem"],
+                "Resource": [
+                    f"arn:aws:dynamodb:{region}:{account_id}:table/{contacts_table}",
+                    f"arn:aws:dynamodb:{region}:{account_id}:table/{contacts_table}/index/*",
+                ],
+            },
+            {
+                "Effect": "Allow",
+                "Action": ["s3:GetObject"],
+                "Resource": [f"arn:aws:s3:::{logs_bucket}/events/*"],
+            },
+            {
+                "Effect": "Allow",
+                "Action": ["connect:DescribeContact"],
+                # 各实例分布在不同 region，用通配符覆盖所有实例
+                "Resource": [
+                    f"arn:aws:connect:*:{account_id}:instance/*/contact/*",
+                ],
+            },
+            # 调用 Bedrock 翻译（nova-lite 或其他模型）
+            {
+                "Effect": "Allow",
+                "Action": ["bedrock:InvokeModel"],
+                "Resource": [
+                    "arn:aws:bedrock:*::foundation-model/*",
+                    f"arn:aws:bedrock:*:{account_id}:inference-profile/*",
+                ],
+            },
+            # 读取 Contact Lens 分析文件（与录音同桶，路径 Analysis/Voice/ 或 Analysis/Chat/）
+            *(
+                [
+                    {
+                        "Effect": "Allow",
+                        "Action": ["s3:GetObject", "s3:ListBucket"],
+                        "Resource": [
+                            *[f"arn:aws:s3:::{rb}" for rb in recordings_buckets],
+                            *[f"arn:aws:s3:::{rb}/*" for rb in recordings_buckets],
+                        ],
+                    }
+                ]
+                if recordings_buckets
+                else []
+            ),
+        ],
+    }
+
+
+def inline_policy_size(doc):
+    """IAM 计入配额的策略长度(不计空白): 紧凑 JSON 的字符数。"""
+    return len(json.dumps(doc, separators=(",", ":")))
+
+
+def check_lambda_role_policy_budget(policies, role_name=""):
+    """校验共用角色上本脚本管理的内联策略合计长度 <= 10,240，超限则报错退出。
+
+    policies: {策略名: 策略文档}。返回合计字符数。
+    注意: 只计算本脚本写入的内联策略，人工另加到该角色的内联策略不在统计内。
+    """
+    sizes = {name: inline_policy_size(doc) for name, doc in policies.items()}
+    total = sum(sizes.values())
+    if total > IAM_ROLE_INLINE_POLICY_LIMIT:
+        detail = ", ".join(f"{n}={s}" for n, s in sizes.items())
+        print(
+            f"错误: Lambda 执行角色 {role_name} 的内联策略合计 {total} 字符，"
+            f"超过 IAM 上限 {IAM_ROLE_INLINE_POLICY_LIMIT}({detail})。"
+            "请减少 config 中的 Connect 实例数量后重试。",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return total
+
+
+def find_legacy_lambda_roles(iam, account_id):
+    """检测旧版本遗留的查询/事件解析 Lambda 角色(尽力而为，任何错误都忽略)。
+
+    返回 [(role_name, inline_policy_names, attached_policy_arns), ...]。
+    """
+    found = []
+    for suffix in LEGACY_LAMBDA_ROLE_SUFFIXES:
+        role_name = f"connect-ai-logs-{account_id}-{suffix}"
+        try:
+            iam.get_role(RoleName=role_name)
+        except Exception:
+            continue
+        try:
+            inline = list(iam.list_role_policies(RoleName=role_name)["PolicyNames"])
+        except Exception:
+            inline = []
+        try:
+            attached = [
+                p["PolicyArn"]
+                for p in iam.list_attached_role_policies(RoleName=role_name)[
+                    "AttachedPolicies"
+                ]
+            ]
+        except Exception:
+            attached = []
+        found.append((role_name, inline, attached))
+    return found
+
+
+def print_legacy_role_notice(legacy, profile, file=None):
+    """若存在旧角色，向 stderr 打印提示与手动清理命令(脚本不会自动删除)。"""
+    if not legacy:
+        return
+    out = file or sys.stderr
+    print(file=out)
+    print(
+        "提示: 解析/查询/事件解析三个 Lambda 现已共用执行角色 "
+        f"connect-ai-logs-{profile}-lambda-role。",
+        file=out,
+    )
+    print(
+        "      以下旧版本创建的角色已不再使用，本脚本不会自动删除，确认后可手动清理:",
+        file=out,
+    )
+    for role_name, inline, attached in legacy:
+        print(f"  · {role_name}", file=out)
+        if not inline:
+            print(
+                f"    aws iam list-role-policies --role-name {role_name} --profile {profile}",
+                file=out,
+            )
+        for p in inline:
+            print(
+                f"    aws iam delete-role-policy --role-name {role_name} "
+                f"--policy-name {p} --profile {profile}",
+                file=out,
+            )
+        for arn in attached:
+            print(
+                f"    aws iam detach-role-policy --role-name {role_name} "
+                f"--policy-arn {arn} --profile {profile}",
+                file=out,
+            )
+        print(
+            f"    aws iam delete-role --role-name {role_name} --profile {profile}",
+            file=out,
+        )
+
+
+def _wait_lambda_ready(lam, name, sleep=time.sleep):
+    """轮询直到 State=Active 且 LastUpdateStatus=Successful(最长约 3 分钟)。"""
+    for _ in range(60):
+        conf = lam.get_function_configuration(FunctionName=name)
+        if conf.get("LastUpdateStatus") == "Failed":
+            raise RuntimeError(
+                f"Lambda {name} 更新失败: {conf.get('LastUpdateStatusReason', '')}"
+            )
+        if conf.get("State") == "Active" and conf.get("LastUpdateStatus") in (
+            "Successful",
+            None,
+        ):
+            return
+        sleep(3)
+    raise RuntimeError(
+        f"等待 Lambda {name} 就绪超时(约 3 分钟): State={conf.get('State')}, "
+        f"LastUpdateStatus={conf.get('LastUpdateStatus')}"
+    )
+
+
+def deploy_process_events_lambda(
+    iam,
+    lam,
+    s3,
+    logs,
+    *,
+    function_name,
+    role_name,
+    role_arn,
+    region,
+    account_id,
+    logs_bucket,
+    connect_arns,
+    instances_meta,
+    work,
+    sleep=time.sleep,
+):
+    """幂等部署事件解析 Lambda(function_name，如 connect-ai-logs-<account>-process-events):
+    在传入的共用执行角色(role_name/role_arn，即 connect-ai-logs-<account>-lambda-role，
+    由调用方事先创建)上写入内联策略 events-read-and-contact，不另建角色；然后部署
+    函数代码与配置、日志组、S3 调用权限，最后合并写入 events/ 前缀的桶事件通知
+    (Id process-events-logs)。返回函数 ARN。"""
+    name = function_name
+
+    # 1) 共用执行角色上的内联策略(put_role_policy 幂等覆盖)
+    print(f"==> 更新共用 Lambda 执行角色内联策略: {role_name} / events-read-and-contact")
+    iam.put_role_policy(
+        RoleName=role_name,
+        PolicyName="events-read-and-contact",
+        PolicyDocument=json.dumps(
+            build_process_events_policy(
+                region, account_id, logs_bucket, connect_arns, name
+            )
+        ),
+    )
+
+    # 2) 部署包
+    zip_path = os.path.join(work, "process_events_logs.zip")
+    _build_process_events_zip(zip_path)
+    with open(zip_path, "rb") as f:
+        zip_bytes = f.read()
+
+    settings = dict(
+        Runtime="python3.12",
+        Role=role_arn,
+        Handler="process_events_logs.handler",
+        Timeout=120,
+        MemorySize=512,
+        Description="Parse events/*.json.gz (AI agent + gateway faqSearch) with contact channel/attributes",
+        Environment={
+            "Variables": {
+                "INSTANCES_META": json.dumps(instances_meta, ensure_ascii=False),
+                "LOGS_BUCKET": logs_bucket,
+            }
+        },
+    )
+
+    # 3) 函数: 存在则更新代码 -> 等待 -> 更新配置(含 Role，旧版本函数会切换到共用角色)；
+    #    否则创建(共用角色/新内联策略传播期间重试)
+    if lambda_function_exists(lam, name):
+        print(f"==> 更新事件解析 Lambda: {name}")
+        _wait_lambda_ready(lam, name, sleep)
+        lam.update_function_code(FunctionName=name, ZipFile=zip_bytes)
+        _wait_lambda_ready(lam, name, sleep)
+        lam.update_function_configuration(FunctionName=name, **settings)
+    else:
+        print(f"==> 创建事件解析 Lambda: {name}")
+        for attempt in range(1, 7):
+            try:
+                lam.create_function(
+                    FunctionName=name, Code={"ZipFile": zip_bytes}, **settings
+                )
+                break
+            except ClientError:
+                if attempt >= 6:
+                    print(
+                        "错误: 创建事件解析 Lambda 失败(共用执行角色或新内联策略可能尚未生效)。请稍后重跑本脚本。",
+                        file=sys.stderr,
+                    )
+                    raise
+                print(f"    等待执行角色生效，重试 ({attempt}/6) ...")
+                sleep(5)
+    print(f"    等待 Lambda {name} 就绪...")
+    _wait_lambda_ready(lam, name, sleep)
+    function_arn = lam.get_function(FunctionName=name)["Configuration"]["FunctionArn"]
+
+    # 4) 日志组 + 保留期
+    log_group = f"/aws/lambda/{name}"
+    try:
+        logs.create_log_group(logGroupName=log_group)
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") != "ResourceAlreadyExistsException":
+            raise
+    logs.put_retention_policy(
+        logGroupName=log_group, retentionInDays=PROCESS_EVENTS_LOG_RETENTION_DAYS
+    )
+
+    # 5) 异步调用不重试(handler 不因单个文件失败而抛错，重试只会重复输出)
+    try:
+        lam.put_function_event_invoke_config(FunctionName=name, MaximumRetryAttempts=0)
+    except ClientError:
+        pass
+    # 限制并发，避免一次同步写入大量 events 文件时打满 Connect API 速率(超出部分由 Lambda 排队)
+    try:
+        lam.put_function_concurrency(
+            FunctionName=name,
+            ReservedConcurrentExecutions=PROCESS_EVENTS_CONCURRENCY,
+        )
+    except ClientError as e:
+        print(f"    警告: 设置预留并发失败(不影响功能): {e}", file=sys.stderr)
+
+    # 6) 允许日志桶调用(固定 StatementId；已存在即复用)
+    try:
+        lam.add_permission(
+            FunctionName=name,
+            StatementId=PROCESS_EVENTS_STATEMENT_ID,
+            Action="lambda:InvokeFunction",
+            Principal="s3.amazonaws.com",
+            SourceArn=f"arn:aws:s3:::{logs_bucket}",
+            SourceAccount=account_id,
+        )
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") != "ResourceConflictException":
+            raise
+        print("    S3 调用权限已存在，复用。")
+    for _ in range(30):
+        try:
+            lam.get_policy(FunctionName=name)
+            break
+        except ClientError:
+            sleep(3)
+
+    # 7) 桶事件通知(合并，Id process-events-logs): events/ 前缀且 .json.gz 后缀 -> 本函数
+    print(f"==> 配置日志桶事件通知(events/*.json.gz) -> {name}")
+    put_lambda_notification(
+        s3,
+        logs_bucket,
+        {
+            "Id": PROCESS_EVENTS_NOTIFICATION_ID,
+            "LambdaFunctionArn": function_arn,
+            "Events": ["s3:ObjectCreated:*"],
+            "Filter": {
+                "Key": {
+                    "FilterRules": [
+                        {"Name": "prefix", "Value": "events/"},
+                        {"Name": "suffix", "Value": ".json.gz"},
+                    ]
+                }
+            },
+        },
+        sleep=sleep,
+    )
+    return function_arn
+
+
+# ---------------------------------------------------------------------------
 # 参数解析
 # ---------------------------------------------------------------------------
 
@@ -235,6 +811,7 @@ def main():
         (LAMBDA_HANDLER, "lib/lambda/handler.py"),
         (CONTACT_SUMMARY, "lib/lambda/contact_summary.py"),
         (PARSER_MODULE, "lib/parse-connect-ai-logs.py"),
+        (PROCESS_EVENTS_HANDLER, "lib/lambda/process_events_logs.py"),
         (os.path.join(WEB_CF_DIR, "auth.js"), "lib/web-cloudfront/auth.js"),
     ]:
         if not os.path.isfile(f):
@@ -318,7 +895,8 @@ def main():
     lambda_name = f"connect-ai-logs-{acct}-splitter"
     lambda_role_name = f"connect-ai-logs-{acct}-lambda-role"
     query_lambda_name = f"connect-ai-logs-{acct}-query"
-    query_role_name = f"connect-ai-logs-{acct}-query-role"
+    process_events_lambda_name = f"connect-ai-logs-{acct}-process-events"
+    # 解析/查询/事件解析三个 Lambda 共用 lambda_role_name 作为执行角色
     api_name = f"connect-ai-logs-{acct}-api"
     contacts_table = f"connect-ai-contacts-{acct}"
     # events_table 已废弃，事件明细改为存 S3 events/{instanceName}/{contactId}.json.gz
@@ -364,6 +942,7 @@ def main():
     cog_idp = _client("cognito-idp", region)
     apigw = _client("apigateway", region)
     ddb = _client("dynamodb", region)
+    logs = _client("logs", region)
 
     # -----------------------------------------------------------------------
     # 1. 计算起始时间
@@ -371,6 +950,88 @@ def main():
     start_ms = ""
     if hours != "0":
         start_ms = str(int((time.time() - int(hours) * 3600) * 1000))
+
+    # -----------------------------------------------------------------------
+    # 1b. 实例预检 + 共用角色内联策略容量校验
+    #     只读调用(DescribeInstance / ListInstanceStorageConfigs)，放在任何 AWS 写入
+    #     (建桶 / DynamoDB / IAM / Lambda / 桶事件通知)之前：InstanceAlias 查询失败或
+    #     内联策略合计超出 IAM 上限时直接退出，不留下部分部署的资源。
+    # -----------------------------------------------------------------------
+    # 收集录音桶（供 Query Lambda 读 Contact Lens 分析文件），以及所有 Connect 实例 ARN（供鉴权角色 Connect 权限）
+    all_recordings_buckets = []
+    all_connect_arns = []
+
+    # 逐实例查询 InstanceAlias（预检，失败则退出，不要到拉日志阶段才失败）
+    instance_names = {}  # inst_key -> InstanceAlias
+    for inst_key, inst_cfg in connect_instances.items():
+        inst_arn = inst_cfg["instance_arn"]
+        inst_region = arn_region(inst_arn)
+        inst_id = inst_arn.split("/")[-1]
+        all_connect_arns.append(inst_arn)
+
+        print(f"==> [{inst_key}] 查询 InstanceAlias ...")
+        try:
+            connect_cli = _client("connect", inst_region)
+            resp = connect_cli.describe_instance(InstanceId=inst_id)
+            alias = resp.get("Instance", {}).get("InstanceAlias", "") or ""
+        except Exception:
+            alias = ""
+        if not alias:
+            print(
+                f"错误: [{inst_key}] 无法查询 InstanceAlias，请确认实例 ARN 与权限。",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        instance_names[inst_key] = alias
+        print(f"    InstanceAlias: {alias}")
+
+        # 查询录音桶（非关键，失败只警告）
+        try:
+            resp = connect_cli.list_instance_storage_configs(
+                InstanceId=inst_id,
+                ResourceType="CALL_RECORDINGS",
+            )
+            rb = (resp.get("StorageConfigs") or [{}])[0].get("S3Config", {}).get(
+                "BucketName", ""
+            ) or ""
+            if rb and rb not in all_recordings_buckets:
+                all_recordings_buckets.append(rb)
+        except Exception:
+            pass
+
+    # instanceName(alias) -> {instanceId, region, configKey}，供 Query Lambda /
+    # 事件解析 Lambda / 前端显示使用
+    instances_meta = {}
+    for inst_key, alias in instance_names.items():
+        inst_arn = connect_instances[inst_key]["instance_arn"]
+        instances_meta[alias] = {
+            "instanceId": inst_arn.split("/")[-1],
+            "region": arn_region(inst_arn),
+            "configKey": inst_key,
+        }
+
+    # 共用执行角色上三份内联策略(2c / 2d / 4.3 分别写入)在此一次性构建并校验合计长度
+    # (IAM 上限 10,240 字符)，超限则在任何写入之前退出
+    splitter_policy = build_splitter_policy(
+        region, account_id, logs_bucket, contacts_table
+    )
+    query_policy = build_query_policy(
+        region, account_id, logs_bucket, contacts_table, all_recordings_buckets
+    )
+    check_lambda_role_policy_budget(
+        {
+            "logs-bucket-rw": splitter_policy,
+            "events-read-and-contact": build_process_events_policy(
+                region,
+                account_id,
+                logs_bucket,
+                all_connect_arns,
+                process_events_lambda_name,
+            ),
+            "ddb-read-and-logs": query_policy,
+        },
+        lambda_role_name,
+    )
 
     # -----------------------------------------------------------------------
     # 2. 日志桶 + Lifecycle(TTL)
@@ -540,72 +1201,16 @@ def main():
     # 事件明细表已废弃，事件改为写 S3 events/{instanceName}/{contactId}.json.gz
 
     # -----------------------------------------------------------------------
-    # 2c. Lambda: 执行角色 + 部署包 + 函数 + S3 触发权限 + 桶事件通知
+    # 2c. Lambda: 共用执行角色 + 部署包 + 函数 + S3 触发权限 + 桶事件通知
+    #     执行角色 connect-ai-logs-<account>-lambda-role 由解析/查询/事件解析三个
+    #     Lambda 共用；这里先创建/更新角色并写入解析 Lambda 的内联策略 logs-bucket-rw，
+    #     2d / 4.3 再在同一角色上写入各自的内联策略。
     # -----------------------------------------------------------------------
-    lambda_trust = {
-        "Version": "2012-10-17",
-        "Statement": [
-            {
-                "Effect": "Allow",
-                "Principal": {"Service": "lambda.amazonaws.com"},
-                "Action": "sts:AssumeRole",
-            }
-        ],
-    }
-    lambda_policy = {
-        "Version": "2012-10-17",
-        "Statement": [
-            {
-                "Effect": "Allow",
-                "Action": ["s3:GetObject", "s3:PutObject"],
-                "Resource": [f"arn:aws:s3:::{logs_bucket}/*"],
-            },
-            {
-                "Effect": "Allow",
-                "Action": [
-                    "logs:CreateLogGroup",
-                    "logs:CreateLogStream",
-                    "logs:PutLogEvents",
-                ],
-                "Resource": "arn:aws:logs:*:*:*",
-            },
-            {
-                "Effect": "Allow",
-                "Action": [
-                    "dynamodb:GetItem",
-                    "dynamodb:PutItem",
-                    "dynamodb:Scan",
-                    "dynamodb:UpdateItem",
-                ],
-                "Resource": [
-                    f"arn:aws:dynamodb:{region}:{account_id}:table/{contacts_table}",
-                ],
-            },
-            {
-                "Effect": "Allow",
-                "Action": ["connect:DescribeContact"],
-                "Resource": [f"arn:aws:connect:*:{account_id}:instance/*/contact/*"],
-            },
-        ],
-    }
-
-    if iam_role_exists(iam, lambda_role_name):
-        print(f"==> 复用 Lambda 执行角色: {lambda_role_name}")
-        iam.update_assume_role_policy(
-            RoleName=lambda_role_name,
-            PolicyDocument=json.dumps(lambda_trust),
-        )
-        lambda_role_arn = iam.get_role(RoleName=lambda_role_name)["Role"]["Arn"]
-    else:
-        print(f"==> 创建 Lambda 执行角色: {lambda_role_name}")
-        lambda_role_arn = iam.create_role(
-            RoleName=lambda_role_name,
-            AssumeRolePolicyDocument=json.dumps(lambda_trust),
-        )["Role"]["Arn"]
+    lambda_role_arn, _ = ensure_lambda_role(iam, lambda_role_name)
     iam.put_role_policy(
         RoleName=lambda_role_name,
         PolicyName="logs-bucket-rw",
-        PolicyDocument=json.dumps(lambda_policy),
+        PolicyDocument=json.dumps(splitter_policy),
     )
 
     # 打包 Lambda 部署包(handler.py + connect_parser.py + contact_summary.py)
@@ -719,37 +1324,27 @@ def main():
 
     # 配置桶事件通知: trigger/ 前缀且 .json 后缀 -> 触发 Lambda
     # S3 会验证 Lambda resource policy，权限刚写入时可能尚未传播，重试最多 6 次
+    # 按 Id 合并写入，保留 events/ 等其它通知配置；若事件解析 Lambda 或其调用权限
+    # 已被删除，先丢弃失效的 process-events-logs 条目(否则 S3 拒绝整次写入)，由 2d 重新写入
     print("==> 配置日志桶事件通知 -> Lambda")
-    notification_cfg = {
-        "LambdaFunctionConfigurations": [
-            {
-                "Id": "process-raw-logs",
-                "LambdaFunctionArn": lambda_arn,
-                "Events": ["s3:ObjectCreated:*"],
-                "Filter": {
-                    "Key": {
-                        "FilterRules": [
-                            {"Name": "prefix", "Value": "trigger/"},
-                            {"Name": "suffix", "Value": ".json"},
-                        ]
-                    }
-                },
-            }
-        ]
-    }
-    for attempt in range(1, 7):
-        try:
-            s3.put_bucket_notification_configuration(
-                Bucket=logs_bucket,
-                NotificationConfiguration=notification_cfg,
-            )
-            break
-        except ClientError as e:
-            if attempt >= 6:
-                print(f"错误: 配置桶事件通知失败: {e}", file=sys.stderr)
-                raise
-            print(f"    Lambda 权限尚未传播，重试 ({attempt}/6)，等待 10s ...")
-            time.sleep(10)
+    put_lambda_notification(
+        s3,
+        logs_bucket,
+        {
+            "Id": "process-raw-logs",
+            "LambdaFunctionArn": lambda_arn,
+            "Events": ["s3:ObjectCreated:*"],
+            "Filter": {
+                "Key": {
+                    "FilterRules": [
+                        {"Name": "prefix", "Value": "trigger/"},
+                        {"Name": "suffix", "Value": ".json"},
+                    ]
+                }
+            },
+        },
+        keep=lambda c: process_events_entry_valid(lam, c),
+    )
 
     # -----------------------------------------------------------------------
     # 3. 对每个 Connect 实例拉取日志 -> 触发 Lambda
@@ -777,47 +1372,25 @@ def main():
             base += ["--start-ms", start_ms]
         return base
 
-    # 收集录音桶（供 Query Lambda 读 Contact Lens 分析文件），以及所有 Connect 实例 ARN（供鉴权角色 Connect 权限）
-    all_recordings_buckets = []
-    all_connect_arns = []
-
-    # 逐实例查询 InstanceAlias（预检，失败则退出，不要到拉日志阶段才失败）
-    instance_names = {}  # inst_key -> InstanceAlias
-    for inst_key, inst_cfg in connect_instances.items():
-        inst_arn = inst_cfg["instance_arn"]
-        inst_region = arn_region(inst_arn)
-        inst_id = inst_arn.split("/")[-1]
-        all_connect_arns.append(inst_arn)
-
-        print(f"==> [{inst_key}] 查询 InstanceAlias ...")
-        try:
-            connect_cli = _client("connect", inst_region)
-            resp = connect_cli.describe_instance(InstanceId=inst_id)
-            alias = resp.get("Instance", {}).get("InstanceAlias", "") or ""
-        except Exception:
-            alias = ""
-        if not alias:
-            print(
-                f"错误: [{inst_key}] 无法查询 InstanceAlias，请确认实例 ARN 与权限。",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        instance_names[inst_key] = alias
-        print(f"    InstanceAlias: {alias}")
-
-        # 查询录音桶（非关键，失败只警告）
-        try:
-            resp = connect_cli.list_instance_storage_configs(
-                InstanceId=inst_id,
-                ResourceType="CALL_RECORDINGS",
-            )
-            rb = (resp.get("StorageConfigs") or [{}])[0].get("S3Config", {}).get(
-                "BucketName", ""
-            ) or ""
-            if rb and rb not in all_recordings_buckets:
-                all_recordings_buckets.append(rb)
-        except Exception:
-            pass
+    # -----------------------------------------------------------------------
+    # 2d. 事件解析 Lambda connect-ai-logs-<account>-process-events (监听 events/)
+    # -----------------------------------------------------------------------
+    # 放在拉取日志之前，保证本次拆分写入的 events 文件也会被解析
+    deploy_process_events_lambda(
+        iam,
+        lam,
+        s3,
+        logs,
+        function_name=process_events_lambda_name,
+        role_name=lambda_role_name,
+        role_arn=lambda_role_arn,
+        region=region,
+        account_id=account_id,
+        logs_bucket=logs_bucket,
+        connect_arns=all_connect_arns,
+        instances_meta=instances_meta,
+        work=work,
+    )
 
     # -----------------------------------------------------------------------
     # 3a. 并发拉取所有实例日志 -> 上传 S3
@@ -1119,106 +1692,13 @@ def main():
             RefreshTokenValidity=1440,
         )["UserPoolClient"]["ClientId"]
 
-    # 4.3 Query Lambda: 执行角色 + 部署包 + 函数
+    # 4.3 Query Lambda: 共用执行角色(lambda_role_name) + 内联策略 + 部署包 + 函数
     all_instance_names = list(instance_names.values())  # 全量实例名，供 * 权限展开
+    # instances_meta 与 query_policy 已在 1b 预检阶段构建，这里直接复用
 
-    # instanceName(alias) -> {instanceId, region, configKey}，供 Query Lambda / 前端显示使用
-    instances_meta = {}
-    for inst_key, alias in instance_names.items():
-        inst_arn = connect_instances[inst_key]["instance_arn"]
-        instances_meta[alias] = {
-            "instanceId": inst_arn.split("/")[-1],
-            "region": arn_region(inst_arn),
-            "configKey": inst_key,
-        }
-
-    query_trust = {
-        "Version": "2012-10-17",
-        "Statement": [
-            {
-                "Effect": "Allow",
-                "Principal": {"Service": "lambda.amazonaws.com"},
-                "Action": "sts:AssumeRole",
-            }
-        ],
-    }
-    query_policy = {
-        "Version": "2012-10-17",
-        "Statement": [
-            {
-                "Effect": "Allow",
-                "Action": [
-                    "logs:CreateLogGroup",
-                    "logs:CreateLogStream",
-                    "logs:PutLogEvents",
-                ],
-                "Resource": "arn:aws:logs:*:*:*",
-            },
-            {
-                "Effect": "Allow",
-                "Action": ["dynamodb:Query", "dynamodb:GetItem"],
-                "Resource": [
-                    f"arn:aws:dynamodb:{region}:{account_id}:table/{contacts_table}",
-                    f"arn:aws:dynamodb:{region}:{account_id}:table/{contacts_table}/index/*",
-                ],
-            },
-            {
-                "Effect": "Allow",
-                "Action": ["s3:GetObject"],
-                "Resource": [f"arn:aws:s3:::{logs_bucket}/events/*"],
-            },
-            {
-                "Effect": "Allow",
-                "Action": ["connect:DescribeContact"],
-                # 各实例分布在不同 region，用通配符覆盖所有实例
-                "Resource": [
-                    f"arn:aws:connect:*:{account_id}:instance/*/contact/*",
-                ],
-            },
-            # 调用 Bedrock 翻译（nova-lite 或其他模型）
-            {
-                "Effect": "Allow",
-                "Action": ["bedrock:InvokeModel"],
-                "Resource": [
-                    "arn:aws:bedrock:*::foundation-model/*",
-                    f"arn:aws:bedrock:*:{account_id}:inference-profile/*",
-                ],
-            },
-            # 读取 Contact Lens 分析文件（与录音同桶，路径 Analysis/Voice/ 或 Analysis/Chat/）
-            *(
-                [
-                    {
-                        "Effect": "Allow",
-                        "Action": ["s3:GetObject", "s3:ListBucket"],
-                        "Resource": [
-                            *[f"arn:aws:s3:::{rb}" for rb in all_recordings_buckets],
-                            *[f"arn:aws:s3:::{rb}/*" for rb in all_recordings_buckets],
-                        ],
-                    }
-                ]
-                if all_recordings_buckets
-                else []
-            ),
-        ],
-    }
-
-    if iam_role_exists(iam, query_role_name):
-        print(f"==> 复用 Query Lambda 执行角色: {query_role_name}")
-        iam.update_assume_role_policy(
-            RoleName=query_role_name,
-            PolicyDocument=json.dumps(query_trust),
-        )
-        query_role_arn = iam.get_role(RoleName=query_role_name)["Role"]["Arn"]
-    else:
-        print(f"==> 创建 Query Lambda 执行角色: {query_role_name}")
-        query_role_arn = iam.create_role(
-            RoleName=query_role_name,
-            AssumeRolePolicyDocument=json.dumps(query_trust),
-        )["Role"]["Arn"]
-        print("    等待 IAM 角色生效(8s)...")
-        time.sleep(8)
+    print(f"==> 更新共用 Lambda 执行角色内联策略: {lambda_role_name} / ddb-read-and-logs")
     iam.put_role_policy(
-        RoleName=query_role_name,
+        RoleName=lambda_role_name,
         PolicyName="ddb-read-and-logs",
         PolicyDocument=json.dumps(query_policy),
     )
@@ -1252,7 +1732,7 @@ def main():
         lam.update_function_configuration(
             FunctionName=query_lambda_name,
             Runtime="python3.12",
-            Role=query_role_arn,
+            Role=lambda_role_arn,  # 旧版本函数在此切换到共用角色
             Handler="query_handler.handler",
             Timeout=30,
             MemorySize=1024,
@@ -1265,7 +1745,7 @@ def main():
                 lam.create_function(
                     FunctionName=query_lambda_name,
                     Runtime="python3.12",
-                    Role=query_role_arn,
+                    Role=lambda_role_arn,
                     Handler="query_handler.handler",
                     Timeout=30,
                     MemorySize=1024,
@@ -1828,6 +2308,8 @@ def main():
     print(f"   Cognito 应用客户端:  {client_id}")
     print(f"   API Gateway URL:     {api_url}")
     print(f"   Query Lambda:        {query_lambda_name}")
+    print(f"   事件解析 Lambda:     {process_events_lambda_name}")
+    print(f"   Lambda 执行角色:     {lambda_role_name}(解析/查询/事件解析 Lambda 共用)")
     print("-------------------------------------------------------------------")
     if cf_status == "Deployed":
         print(" 提示: CloudFront 已部署完成，可直接访问上面的地址。")
@@ -1843,6 +2325,10 @@ def main():
 
     if args.keep:
         print(f" 临时产物目录已保留: {work}")
+
+    # 旧版本遗留的 -query-role / -process-events-role: 函数已在本次切换到共用角色，
+    # 仅提示手动清理，不自动删除
+    print_legacy_role_notice(find_legacy_lambda_roles(iam, account_id), account_id)
 
 
 if __name__ == "__main__":

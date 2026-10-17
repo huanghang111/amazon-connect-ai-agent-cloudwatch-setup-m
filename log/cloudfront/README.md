@@ -10,16 +10,17 @@
 
 | 资源 | 名称 / 说明 |
 | --- | --- |
-| S3 日志桶 | `connect-ai-logs-<account_id>`;`raw/`、`trigger/` 前缀 7 天后自动过期;配置了 CORS(GET/HEAD);`trigger/*.json` 的创建事件触发解析 Lambda |
+| S3 日志桶 | `connect-ai-logs-<account_id>`;`raw/`、`trigger/` 前缀 7 天后自动过期;配置了 CORS(GET/HEAD);`trigger/*.json` 的创建事件触发解析 Lambda,`events/*.json.gz` 的创建事件触发事件解析 Lambda |
 | S3 Web 桶 | `connect-ai-logs-<account_id>-web`;关闭公共访问,仅允许该 CloudFront 分配经 OAC 读取 |
 | DynamoDB 表 | `connect-ai-contacts-<account_id>`(分区键 `instanceName`,排序键 `contactId`;GSI `by-instance-time`:`instanceName` + `minTs`;按需计费) |
-| 解析 Lambda | `connect-ai-logs-<account_id>-splitter`(python3.12,超时 900s,内存由 `--lambda-memory` 控制,异步重试次数 0);角色 `connect-ai-logs-<account_id>-lambda-role` |
-| 查询 Lambda | `connect-ai-logs-<account_id>-query`(python3.12,超时 30s,内存 1024MB);角色 `connect-ai-logs-<account_id>-query-role` |
+| 解析 Lambda | `connect-ai-logs-<account_id>-splitter`(python3.12,超时 900s,内存由 `--lambda-memory` 控制,异步重试次数 0);执行角色 `connect-ai-logs-<account_id>-lambda-role`,三个 Lambda 共用这一个角色,角色上有三份内联策略 `logs-bucket-rw`(解析)/ `ddb-read-and-logs`(查询)/ `events-read-and-contact`(事件解析),三者权限为合并后的并集 |
+| 查询 Lambda | `connect-ai-logs-<account_id>-query`(python3.12,超时 30s,内存 1024MB);执行角色与解析 Lambda 共用 `connect-ai-logs-<account_id>-lambda-role`(内联策略 `ddb-read-and-logs`) |
+| 事件解析 Lambda | `connect-ai-logs-<account_id>-process-events`(python3.12,超时 120s,内存 512MB,异步重试次数 0,预留并发 5);执行角色与解析 Lambda 共用 `connect-ai-logs-<account_id>-lambda-role`(内联策略 `events-read-and-contact`);桶通知 Id `process-events-logs`;日志组 `/aws/lambda/connect-ai-logs-<account_id>-process-events` 保留 30 天 |
 | API Gateway | REST API `connect-ai-logs-<account_id>-api`,stage `prod`,Cognito Authorizer `cognito-auth` |
 | Cognito 用户池 | `connect-ai-agent-logs-<account_id>`(仅管理员可创建用户,邮箱作用户名,含自定义属性 `custom:instances`)及应用客户端 `connect-ai-agent-logs-<account_id>-web`(无 secret,启用 `USER_PASSWORD_AUTH`) |
 | CloudFront | OAC `connect-ai-logs-<account_id>-oac`;分配的 Comment 为 `connect-ai-agent-logs-<account_id>`,HTTPS 重定向,默认根对象 `index.html`,403/404 回落到 `/index.html` |
 
-API 路由(均转发到查询 Lambda):`GET /instances`、`GET /contacts`、`GET /contacts/{contactId}/events`、`GET /contacts/{contactId}/describe`(以上需 Cognito IdToken),以及 `POST /translate`(代码中为无 API 鉴权,Bedrock 权限由查询 Lambda 角色控制)。
+API 路由(均转发到查询 Lambda):`GET /instances`、`GET /contacts`、`GET /contacts/{contactId}/events`、`GET /contacts/{contactId}/describe`(以上需 Cognito IdToken),以及 `POST /translate`(代码中为无 API 鉴权,Bedrock 权限由共用 Lambda 执行角色上的 `ddb-read-and-logs` 内联策略控制)。
 
 > 注意:脚本顶部 docstring 提到 Cognito 身份池/鉴权角色,但代码实际**没有创建**身份池或鉴权角色(`auth.js` 也说明不再使用 Identity Pool),前端通过 API Gateway 访问数据。
 
@@ -37,6 +38,12 @@ s3://connect-ai-logs-<account_id>/raw/<实例key>/connect.ndjson (与 gateway.nd
    ├─ S3: events/<instanceName>/<contactId>.json.gz (事件明细)
    └─ S3: <实例key>/index.json (解析结果/错误,脚本据此判断完成)
 
+S3: events/<instanceName>/<contactId>.json.gz  →  S3 事件触发
+   ▼
+事件解析 Lambda connect-ai-logs-<account_id>-process-events (process_events_logs.py,部署时与 contact_summary.py 一起打包)
+   ├─ Connect DescribeContact / GetContactAttributes (渠道 + 联系人属性)
+   └─ CloudWatch Logs: /aws/lambda/connect-ai-logs-<account_id>-process-events (每个文件一行 JSON 解析结果)
+
 浏览器 → CloudFront(静态站点, auth.js 登录 Cognito)
        → API Gateway (IdToken) → 查询 Lambda → DynamoDB / S3 预签名 URL / Connect DescribeContact / Bedrock 翻译
 ```
@@ -46,12 +53,12 @@ s3://connect-ai-logs-<account_id>/raw/<实例key>/connect.ndjson (与 gateway.nd
 - **Python**:`python3`(代码未声明最低版本;解析 Lambda 运行时为 python3.12)。
 - **依赖包**:`boto3`(`pip install boto3`)。
 - **AWS 凭证**:脚本把 **AWS profile 名固定为账号 ID**(即 config 第一个实例 ARN 中的账号),主脚本和 `fetch-to-s3.py` 子进程都使用 `--profile <account_id>`。因此本机 `~/.aws/config` / `credentials` 中需要存在名为 `<account_id>` 的 profile。
-- **权限**:该 profile 需要能操作以下服务(脚本里实际调用到的):S3、IAM(创建/更新角色及内联策略)、Lambda、DynamoDB、Cognito User Pools、API Gateway、CloudFront(OAC、分配、失效)、CloudWatch Logs(`filter_log_events`)、Amazon Connect(`DescribeInstance`、`ListInstanceStorageConfigs`)。
+- **权限**:该 profile 需要能操作以下服务(脚本里实际调用到的):S3、IAM(创建/更新角色及内联策略)、Lambda、DynamoDB、Cognito User Pools、API Gateway、CloudFront(OAC、分配、失效)、CloudWatch Logs(`filter_log_events`、`create_log_group`、`put_retention_policy`)、Amazon Connect(`DescribeInstance`、`ListInstanceStorageConfigs`)。
 - **需要预先存在的资源**:
   - 各 Connect 实例,且能查询到其 `InstanceAlias`(查不到会直接退出)。
   - `ai_log_arn` 对应的 AI Agent 日志组。可用上一级目录的 `../setup_connect_ai_agent_logs.py` 创建(它会建立日志投递并创建日志组 `/aws/connect/ai-agent-logs-<InstanceAlias>`,并读取本目录下的 `config-*.json`)。
   - `gateway_log_arn`(可选)对应的 AgentCore Gateway 应用日志组。
-- **依赖文件**(缺失会报错退出,见下方目录结构):`lib/fetch-to-s3.py`、`lib/lambda/handler.py`、`lib/parse-connect-ai-logs.py`、`lib/web-cloudfront/auth.js`;另外会用到 `lib/lambda/query_handler.py` 与 `lib/web/*`。
+- **依赖文件**(缺失会报错退出,见下方目录结构):`lib/fetch-to-s3.py`、`lib/lambda/handler.py`、`lib/parse-connect-ai-logs.py`、`lib/lambda/process_events_logs.py`、`lib/web-cloudfront/auth.js`;另外会用到 `lib/lambda/query_handler.py` 与 `lib/web/*`。
 - **网络**:本机需能访问各 AWS 服务端点。
 
 ### 配置文件 `config-<account_id>.json`
@@ -98,7 +105,7 @@ python3 setup_cloudfront.py [--config <file>] [--out-dir <dir>] [--keep] \
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
 | `--config <file>` | `config.json` | 配置文件名,按**脚本所在目录**解析路径。见下方「配置文件选择」 |
-| `--out-dir <dir>` | 系统临时目录 | 临时部署产物目录(`lambda.zip`、`query_lambda.zip`) |
+| `--out-dir <dir>` | 系统临时目录 | 临时部署产物目录(`lambda.zip`、`process_events_logs.zip`、`query_lambda.zip`) |
 | `--keep` | 关 | 保留临时产物目录;不加则脚本退出时删除(包括用 `--out-dir` 指定的目录) |
 | `--lambda-memory <MB>` | `1024` | 解析 Lambda 内存 |
 | `--csat-attr <key>` | 环境变量 `CSAT_ATTRIBUTE_KEY`,否则 `botevaluation` | CSAT 满意度评分对应的联系人属性键名 |
@@ -123,12 +130,14 @@ python3 setup_cloudfront.py --config config-<account_id>.json \
 ### 执行流程(与代码顺序一致)
 
 1. 检查依赖文件、读取并校验 config(邮箱格式、`connect` 非空)。
+   接着(只读,在任何 AWS 写入之前)对每个实例查询 `InstanceAlias`(失败则退出),并尝试查询通话录音桶(失败只忽略);
+   再校验共用角色上三份内联策略的合计长度(IAM 上限 10,240 字符,1 个实例约 2,200,10 个实例约 3,900;超限则报错退出)。
 2. 创建/复用日志桶,配置 Lifecycle 与 CORS;创建/复用 DynamoDB 表(缺 GSI 时补建)。
-3. 创建/更新解析 Lambda 及其角色,配置 S3 `trigger/*.json` 事件通知。
-4. 对每个实例查询 `InstanceAlias`(失败则退出),并尝试查询通话录音桶(失败只忽略)。
+3. 创建/更新共用 Lambda 执行角色 `connect-ai-logs-<account_id>-lambda-role`(写入内联策略 `logs-bucket-rw`)与解析 Lambda,配置 S3 `trigger/*.json` 事件通知。
+4. 创建/更新事件解析 Lambda `connect-ai-logs-<account_id>-process-events`(在共用角色上写入内联策略 `events-read-and-contact`,部署代码与配置、日志组、S3 调用权限),并合并写入 `events/*.json.gz` 事件通知。放在拉取日志之前,本次写入的 events 文件也会被解析。
 5. 并发启动 `fetch-to-s3.py` 拉取各实例的 AI Agent / Gateway 日志到 `raw/<key>/`;任一拉取失败的实例会被跳过。
 6. 删除旧的 `<key>/index.json`,写入 `trigger/<key>.json` 触发 Lambda,轮询 `index.json`(最长约 16 分钟,超时则提示 Lambda 仍在后台处理)。
-7. 创建/复用 Cognito 用户池与应用客户端;创建/更新查询 Lambda;配置并部署 API Gateway(`prod`);创建登录用户。
+7. 创建/复用 Cognito 用户池与应用客户端;在共用角色上写入内联策略 `ddb-read-and-logs` 并创建/更新查询 Lambda;配置并部署 API Gateway(`prod`);创建登录用户。
 8. 上传前端文件到 Web 桶,创建/复用 OAC 与 CloudFront 分配,写 Web 桶策略,发起 `/*` 失效,等待 CloudFront 变为 `Deployed`(最长等 1200 秒,超时则提示稍后用 `aws cloudfront get-distribution` 查看)。
 
 ### 幂等性 / 重复执行
@@ -138,7 +147,24 @@ python3 setup_cloudfront.py --config config-<account_id>.json \
 - 重跑会**重新拉取日志并重新触发解析**,已存在的 Contact 摘要与事件明细会被覆盖写入。
 - 重跑会重新部署 Lambda 代码与配置,并更新前端文件和 `aws-config.js`。
 - 已存在的登录用户不会重新创建(不会重发一次性密码)。
-- 日志桶的事件通知配置会被整体设置为本脚本的配置。
+- 日志桶的事件通知按 Id(`process-raw-logs`、`process-events-logs`)合并写入:同 Id 或同函数且同过滤规则的旧条目被替换,其它 Lambda/SNS/SQS/EventBridge 通知配置保留。若事件解析 Lambda 或其 `s3invoke-events` 调用权限被手工删除,第 3 步会先丢弃失效的 `process-events-logs` 条目,第 4 步重新部署后再写回;其它保留的配置若指向已删除的目标,S3 会拒绝写入,需要先手工清理。
+- 事件解析 Lambda 不去重:每次同步都会覆盖写入窗口内所有 Contact 的 events 文件,所以同一 Contact 每次同步都会再输出一条结果,可用 `key`/`eTag`/`eventTime` 区分。
+- 从旧版本升级(一次性清理):旧版本为查询 Lambda 和事件解析 Lambda 分别创建了 `connect-ai-logs-<account_id>-query-role` 和 `connect-ai-logs-<account_id>-process-events-role`。重跑脚本会通过 `update_function_configuration` 把两个函数切换到 `connect-ai-logs-<account_id>-lambda-role`;脚本结束时若检测到旧角色仍存在,会在 stderr 打印提示和对应的清理命令。脚本**不会自动删除**旧角色,确认两个函数已切换后可手动执行:
+
+  ```bash
+  ACCT=<account_id>
+  for R in connect-ai-logs-$ACCT-query-role connect-ai-logs-$ACCT-process-events-role; do
+    aws iam list-role-policies --role-name "$R" --profile "$ACCT"
+    aws iam list-attached-role-policies --role-name "$R" --profile "$ACCT"
+  done
+  # 按上面列出的策略名逐个删除(query-role 通常是 ddb-read-and-logs;
+  # process-events-role 通常是 events-read-and-contact,更早版本可能还有 process-events-logs)
+  aws iam delete-role-policy --role-name connect-ai-logs-$ACCT-query-role --policy-name ddb-read-and-logs --profile "$ACCT"
+  aws iam delete-role-policy --role-name connect-ai-logs-$ACCT-process-events-role --policy-name events-read-and-contact --profile "$ACCT"
+  # 有托管策略时先 detach: aws iam detach-role-policy --role-name <role> --policy-arn <arn> --profile "$ACCT"
+  aws iam delete-role --role-name connect-ai-logs-$ACCT-query-role --profile "$ACCT"
+  aws iam delete-role --role-name connect-ai-logs-$ACCT-process-events-role --profile "$ACCT"
+  ```
 
 ## 4. 执行后的产出
 
@@ -146,13 +172,24 @@ python3 setup_cloudfront.py --config config-<account_id>.json \
 
 - CloudFront 访问地址 `https://<xxxx>.cloudfront.net`、分配 ID 与部署状态。
 - 登录邮箱、每个实例的处理结果(Contact 数量 / 解析报错 / Lambda 处理中)。
-- 资源清单:日志桶、Web 桶、解析/查询 Lambda 名、Cognito 用户池 ID 与应用客户端 ID、API Gateway URL。
+- 资源清单:日志桶、Web 桶、解析/查询/事件解析 Lambda 名、`Lambda 执行角色`(三个 Lambda 共用的 `connect-ai-logs-<account_id>-lambda-role`)、Cognito 用户池 ID 与应用客户端 ID、API Gateway URL。
+- 若账号里还留有旧版本的 `-query-role` / `-process-events-role`,最后会在 stderr 打印旧角色提示和手动清理命令(见上一节"从旧版本升级")。
 
 **生成的内容**:
 
-- 本地:仅有临时的 `lambda.zip`、`query_lambda.zip`(默认执行结束即删除,`--keep` 保留)。脚本不会修改本目录下的任何源文件。
+- 本地:仅有临时的 `lambda.zip`、`process_events_logs.zip`、`query_lambda.zip`(默认执行结束即删除,`--keep` 保留)。脚本不会修改本目录下的任何源文件。
 - Web 桶中的文件:`index.html`(由 `lib/web/index.html` 改写:移除 `data.js` 引用,改为加载 AWS SDK、`aws-config.js`、`auth.js`,并给脚本加版本号)、`app.js`、`i18n.js`、`site-config.js`、`auth.js`、`aws-config.js`,以及 `connect-enrich.js`(`lib/web/` 下没有该文件时上传一个空占位)。
 - `aws-config.js` 由脚本即时生成并直接上传(不落本地),包含区域、用户池 ID、应用客户端 ID、API URL、第一个实例的 ID/ARN/区域、`csatAttribute` 等运行时配置。
+
+**事件解析 Lambda 的输出**(`/aws/lambda/connect-ai-logs-<account_id>-process-events`,可用 `aws logs tail /aws/lambda/connect-ai-logs-<account_id>-process-events --follow` 查看):每个 `events/<instanceName>/<contactId>.json.gz` 输出一行 JSON(`type=process-events-logs.result`),主要字段:
+
+- `bucket`、`key`、`eTag`、`versionId`、`sequencer`、`eventTime`、`instanceName`、`instanceId`、`connectRegion`、`contactId`。
+- `contact`:DescribeContact 的 `channel`、`initiationMethod`、各时间戳、`disconnectReason`、`initialContactId`、`queueInfo`、`agentInfo` 等;`attributes`:GetContactAttributes 的全部属性。失败时对应写 `contactError` / `attributesError`(文件名不是 Contact ID、实例不在 `INSTANCES_META`、ResourceNotFound 等),不影响解析结果输出。
+- `analysis.transcript.sessions`:`process_events_logs.py` 中 `parse_agentic_message` + `dedupe_latest_by_session` 的原样输出(对话、`faq_events` 的 query/命中/置信度/追问)。
+- `analysis.faqSearch`:`transcriptCalls`/`transcriptHits`;`toolSpans`(`TRANSCRIPT_AI_AGENT_TRACE` 中 faqSearch 的 execute_tool:输入、状态、成功与否、耗时 ms、输出预览);`gateway`(提到 faqSearch 的 Gateway 日志条数、错误数、条目)。
+- `analysis.counts`、`analysis.logSummary`(与 DynamoDB 摘要同口径的 faqAsk/faqSend/errors 等)。
+
+单行超过 `MAX_LOG_BYTES`(默认 200000 字节)时,先把超过 2000 字符的字符串截断并标记 `truncated: true`;仍超限则拆成多行 `type=process-events-logs.chunk`,按 `part` 顺序拼接 `data` 即为完整 JSON。`attributes` 可能包含个人信息,会写入该日志组(保留 30 天)。
 
 **认证方式**:
 
@@ -170,6 +207,7 @@ python3 setup_cloudfront.py --config config-<account_id>.json \
 | `lib/parse-connect-ai-logs.py` | 日志解析模块,打包进解析 Lambda 时重命名为 `connect_parser.py` |
 | `lib/lambda/handler.py` | 解析 Lambda 入口(S3 事件触发,写 DynamoDB 与 S3 明细) |
 | `lib/lambda/query_handler.py` | 查询 Lambda(API Gateway 后端,按 `custom:instances` 校验实例权限) |
+| `lib/lambda/process_events_logs.py` | 事件解析 Lambda `connect-ai-logs-<account_id>-process-events` 入口,内含 AI Agent 会话 / faqSearch 调用解析;部署时与 `lib/lambda/contact_summary.py` 一起打包;详见 [lib/lambda/README.md](lib/lambda/README.md) |
 | `lib/lambda/sync_log_handler.py` | 独立的 Lambda 入口,按实例拉取日志并触发解析,前置条件是本脚本已创建好基础设施;本脚本不部署它 |
 | `lib/lambda/faq_retrieval_log.py` | 定时 FAQ 分析 Lambda(查询 CloudWatch 日志并上传到外部 FAQ 检索日志服务);本脚本不部署它 |
 | `lib/web/` | 前端文件:`index.html`、`app.js`、`i18n.js`、`site-config.js` |

@@ -15,12 +15,13 @@
 | DynamoDB 表 | `connect-ai-contacts-<account>`,另有一张表 |
 | 解析 Lambda | `connect-ai-logs-<account>-splitter`(S3 事件触发) |
 | 查询 Lambda | `connect-ai-logs-<account>-query` |
-| IAM 角色 | `…-lambda-role`、`…-query-role`,以及 Cognito 鉴权角色 |
+| 事件解析 Lambda | `connect-ai-logs-<account>-process-events`(`events/*.json.gz` 创建事件触发,桶通知 Id `process-events-logs`;结果写入 `/aws/lambda/connect-ai-logs-<account>-process-events`,保留 30 天) |
+| IAM 角色 | `…-lambda-role`(解析/查询/事件解析 Lambda 共用,内联策略 `logs-bucket-rw`、`ddb-read-and-logs`、`events-read-and-contact`),以及 Cognito 鉴权角色 |
 | Cognito | 用户池、应用客户端、身份池 |
 | API Gateway | `connect-ai-logs-<account>-api`(stage 为 `prod`) |
 | CloudFront | 分配 + OAC(使用默认 `*.cloudfront.net` 域名) |
 
-数据流:本机 profile 通过 `filter_log_events` 把 CloudWatch 日志拉到 S3 `raw/<实例名>/`,写入 `trigger/<实例名>.json`,S3 事件触发解析 Lambda,按 InstanceAlias 写入 DynamoDB。拉取日志的是运行脚本的本机身份,Lambda 不读 CloudWatch。
+数据流:本机 profile 通过 `filter_log_events` 把 CloudWatch 日志拉到 S3 `raw/<实例名>/`,写入 `trigger/<实例名>.json`,S3 事件触发解析 Lambda,按 InstanceAlias 写入 DynamoDB。拉取日志的是运行脚本的本机身份,Lambda 不读 CloudWatch。解析 Lambda 写出的每个 `events/<instanceName>/<contactId>.json.gz` 再触发事件解析 Lambda `connect-ai-logs-<account>-process-events`:用 `cloudfront/lib/lambda/process_events_logs.py` 内置的会话解析逻辑解析 faqSearch 调用,附上 DescribeContact 渠道和 GetContactAttributes 属性,每个文件输出一行 JSON 到它自己的 CloudWatch 日志。
 
 ## 2. 前置条件
 
@@ -122,9 +123,9 @@ python3 -u setup_cloudfront.py --config config-123456789012.json
 
 执行过程大致分这几段,CloudFront 分配通常等 3 到 10 分钟:
 
-1. 打印部署配置(区域、账号、实例、桶名、邮箱、拉取范围)。
-2. 创建日志桶、DynamoDB 表、解析 Lambda 和角色,配置 S3 事件通知。
-3. 对每个实例查询 InstanceAlias,拉取 AI Agent 日志和 Gateway 日志到 S3,等待 Lambda 解析出 Contact。
+1. 打印部署配置(区域、账号、实例、桶名、邮箱、拉取范围);对每个实例查询 InstanceAlias 和录音桶(只读),并校验共用角色内联策略合计长度。任一失败都在创建或修改任何 AWS 资源之前退出。
+2. 创建日志桶、DynamoDB 表、共用 Lambda 执行角色 `…-lambda-role` 和解析 Lambda,配置 S3 事件通知(按 Id 合并,保留其它通知配置);在拉取日志前创建/更新事件解析 Lambda `connect-ai-logs-<account>-process-events` 及其 `events/*.json.gz` 通知(Id `process-events-logs`)。查看结果:`aws logs tail /aws/lambda/connect-ai-logs-<account>-process-events --follow`。
+3. 拉取 AI Agent 日志和 Gateway 日志到 S3,等待 Lambda 解析出 Contact。
 4. 创建 Cognito、查询 Lambda、API Gateway,并向邮箱发送一次性密码。
 5. 发布站点到 Web 桶,创建 OAC 和 CloudFront 分配,等待状态变为 Deployed。
 
@@ -153,6 +154,21 @@ python3 -u setup_cloudfront.py --config config-123456789012.json
 - 重跑同一条命令会重新拉取并归档日志,再触发 Lambda 解析。已存在的 Contact 日志会被覆盖写入。
 - 想看更早的数据,调大 `hours`,或设为 `0`。
 - 日志桶的 `raw/` 和 `trigger/` 前缀 7 天后自动删除,解析后的数据保存在 DynamoDB。
+- 从旧版本升级:旧版本额外创建了 `connect-ai-logs-<account>-query-role` 和 `connect-ai-logs-<account>-process-events-role`。重跑会把查询 Lambda 和事件解析 Lambda 切换到 `…-lambda-role`,旧角色不会被自动删除;脚本结束时若检测到它们,会在 stderr 打印清理命令。确认切换后可手动清理(先用 `list-role-policies` / `list-attached-role-policies` 查看实际策略名):
+
+```bash
+ACCT=123456789012
+aws iam list-role-policies --role-name connect-ai-logs-$ACCT-query-role --profile $ACCT
+aws iam list-attached-role-policies --role-name connect-ai-logs-$ACCT-query-role --profile $ACCT
+aws iam delete-role-policy --role-name connect-ai-logs-$ACCT-query-role --policy-name ddb-read-and-logs --profile $ACCT
+# 有托管策略时先 detach: aws iam detach-role-policy --role-name connect-ai-logs-$ACCT-query-role --policy-arn <arn> --profile $ACCT
+aws iam delete-role --role-name connect-ai-logs-$ACCT-query-role --profile $ACCT
+aws iam list-role-policies --role-name connect-ai-logs-$ACCT-process-events-role --profile $ACCT
+aws iam list-attached-role-policies --role-name connect-ai-logs-$ACCT-process-events-role --profile $ACCT
+aws iam delete-role-policy --role-name connect-ai-logs-$ACCT-process-events-role --policy-name events-read-and-contact --profile $ACCT
+# 有托管策略时先 detach: aws iam detach-role-policy --role-name connect-ai-logs-$ACCT-process-events-role --policy-arn <arn> --profile $ACCT
+aws iam delete-role --role-name connect-ai-logs-$ACCT-process-events-role --profile $ACCT
+```
 
 ## 9. 常见问题
 
@@ -172,6 +188,8 @@ python3 -u setup_cloudfront.py --config config-123456789012.json
 - 脚本没有 ARN 格式校验。格式错误会直接抛异常,不会给出可读提示。
 - 脚本没有一键卸载功能。需要清理时,按第 1 节的资源列表逐个删除。
 - 查询 Lambda 和解析 Lambda 的 `connect:DescribeContact` 权限目前是通配实例(`instance/*/contact/*`),没有收窄到配置的实例。
+- 三个 Lambda 共用一个执行角色,每个函数实际拥有三份内联策略的并集权限(例如查询 Lambda 也能写日志桶)。
+- 共用角色的内联策略合计不能超过 IAM 上限 10,240 字符。按典型命名估算约 44 个 Connect 实例才会超限,脚本会在写入前校验并报错退出。
 
 ## 11. 相关文件
 
@@ -183,4 +201,5 @@ python3 -u setup_cloudfront.py --config config-123456789012.json
 | `cloudfront/lib/fetch-to-s3.py` | 日志拉取 |
 | `cloudfront/lib/lambda/handler.py` | 解析 Lambda |
 | `cloudfront/lib/lambda/query_handler.py` | 查询 Lambda |
+| `cloudfront/lib/lambda/process_events_logs.py` | 事件解析 Lambda(内含 AI Agent 会话 / faqSearch 解析;部署时与 `cloudfront/lib/lambda/contact_summary.py` 一起打包) |
 | `.agents/tasks/cloudfront-arn-config-analysis.md` | ARN 驱动部署的分析报告 |
