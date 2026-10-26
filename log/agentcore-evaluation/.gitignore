@@ -1,0 +1,41 @@
+# 本地配置(含账号专属的日志组名/assistant id/桶名/区域)，不要提交
+config.env
+config.*.env
+!config.env.example
+
+# deploy.sh 的打包产物
+.packaged.yaml
+*.zip
+__pycache__/
+*.pyc
+
+# ---------------------------------------------------------------------------
+# 从 S3 同步下来的运行结果。里面有客户真实对话内容、完整系统提示词，以及
+# Connect 的 contact/instance/session/assistant id，绝不能进仓库。
+# 结果只应留在 S3 结果桶和客户本地。
+#
+# 按目录名挡不住：`aws s3 sync` 的本地路径由使用者随手指定（results2/、
+# tmp/、20260804/ ...），只要换个名字产物就漏出来了。所以这里按**产物文件名**
+# 挡，无论落在哪一层目录都能命中。
+# ---------------------------------------------------------------------------
+results/
+runs/
+
+# 每步的原始输出 + 汇总/报告
+collect.json
+ingest.json
+eval.json
+insights.json
+recommendation.json
+summary.json
+index.html
+system_prompt.txt
+eval_scores.csv
+
+# 转换后的 sessionSpans / 图表 / 推荐结果
+sessions/
+charts/
+recommendation/
+
+*.csv
+*.png

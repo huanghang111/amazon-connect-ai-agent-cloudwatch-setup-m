@@ -1,0 +1,840 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Automated Amazon Connect AI Agent log evaluation. Collects finished sessions
+  from the Connect delivery log group, converts them to OTEL, writes them into
+  AgentCore Observability, then runs AgentCore Evaluation, Insights and
+  Recommendation on a schedule and publishes every result to S3.
+
+Parameters:
+  ConnectLogGroup:
+    Type: String
+    Default: /aws/connect/ai-agent-logs
+    Description: CloudWatch log group receiving Connect AI Agent logs (created by ../setup_connect_ai_agent_logs.py or the Connect console).
+
+  ObservabilityRuntimeName:
+    Type: String
+    Default: connect-ai-agent
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9-]{0,40}'
+    Description: >
+      Logical runtime name for AgentCore Observability. Spans and events land under
+      /aws/bedrock-agentcore/runtimes/<name>-DEFAULT and the service is discovered
+      as <name>.DEFAULT.
+
+  ResultsBucketName:
+    Type: String
+    Default: ''
+    Description: Existing S3 bucket for results. Leave empty to create a dedicated bucket.
+
+  LookbackHours:
+    Type: Number
+    Default: 24
+    MinValue: 1
+    MaxValue: 168
+    Description: Window read on each run. A daily schedule pairs with 24.
+
+  MaxAgeDays:
+    Type: Number
+    Default: 14
+    MinValue: 1
+    MaxValue: 365
+    Description: >-
+      Sessions older than this are skipped. Values above 14 rely on the ingest
+      step shifting old sessions into the PutLogEvents window, so raise it only
+      to backfill or validate against archived logs.
+
+  OverlapMinutes:
+    Type: Number
+    Default: 30
+    Description: >
+      Extra lookback beyond LookbackHours so sessions that straddle a window
+      boundary, or whose delivery lagged, are not lost. Duplicates are prevented
+      by the DynamoDB ledger, so overlap is free.
+
+  SettleMinutes:
+    Type: Number
+    Default: 10
+    Description: A session is only evaluated once its newest event is this old (i.e. the call has ended).
+
+  Evaluators:
+    Type: String
+    Default: ALL
+    Description: >
+      Comma-separated Builtin evaluator IDs, or ALL for the 13 that work without
+      ground truth. The API caps a job at 10 evaluators, so ALL runs 2 concurrent jobs.
+      Evaluation is the dominant cost driver: it is one LLM call per evaluator per trace.
+
+  Insights:
+    Type: String
+    Default: Builtin.Insight.FailureAnalysis,Builtin.Insight.UserIntent
+    Description: Comma-separated insight IDs (public preview).
+
+  RecommendationEvaluator:
+    Type: String
+    Default: Helpfulness
+    Description: The single Builtin evaluator that guides system-prompt optimization (API allows exactly one).
+
+  ScheduleExpression:
+    Type: String
+    Default: cron(0 3 * * ? *)
+    Description: EventBridge schedule. Default 03:00 UTC daily.
+
+  ScheduleEnabled:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+
+  LedgerTtlDays:
+    Type: Number
+    Default: 30
+    Description: How long an evaluated sessionId is remembered for deduplication.
+
+  MaxSessionsPerRun:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    Description: >
+      Upper bound on sessions evaluated per run (0 = unlimited). Evaluation is one
+      LLM call per evaluator per trace, so this bounds the cost of one run. Newest
+      sessions are taken first; the rest are listed under skipped.deferred and
+      picked up by a later run that still covers them.
+
+  ShiftOlderThanDays:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    MaxValue: 13
+    Description: >
+      Sessions whose oldest event is older than this many days are shifted
+      forward to the current time before ingestion. Needed because batch
+      evaluation only discovers span documents from the recent past (a 13-day-old
+      session fails with "no span documents"; the same session scores once
+      shifted). Original timestamps are kept in the run's collect.json.
+
+  ArchiveBucket:
+    Type: String
+    Default: ''
+    Description: >
+      Optional. Name of an S3 bucket holding NDJSON archives of the Connect log
+      group ({"timestamp","message"} per line). Grants the collect step read
+      access so run-now.sh --archive s3://<bucket>/<prefix> can replay historical
+      logs through the pipeline for validation. The scheduled path never uses it.
+
+  IndexBudgetSeconds:
+    Type: Number
+    Default: 180
+    MinValue: 60
+    MaxValue: 240
+    Description: >
+      How long ONE WaitIndexed attempt polls before it re-writes the still-missing
+      log events and hands back to Step Functions. Capped at 240 so the rewrite
+      still fits inside the function's 300s timeout. Raise it, and IndexMaxAttempts,
+      in a Region where the first run's data takes longer to become queryable.
+
+  IndexMaxAttempts:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 20
+    Description: >
+      How many WaitIndexed attempts before the run fails with LogEventsNotIndexed.
+      Total wait is roughly IndexMaxAttempts * (IndexBudgetSeconds + 120s pause).
+
+  RequireSpanIndex:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Whether WaitIndexed also waits for the span documents in aws/spans to become
+      queryable, not just the runtime log events. Set to false only if that half of
+      the gate never opens in your Region even though the spans are present; the
+      evaluation job then reports the truth instead of the gate timing out.
+
+  Boto3LayerArn:
+    Type: String
+    Default: ''
+    Description: >
+      Lambda layer providing a current boto3. Required: the runtime's bundled
+      boto3 does not know the bedrock-agentcore batch evaluation and
+      recommendation APIs. Built and passed in by deploy.sh.
+
+  MatplotlibLayerArn:
+    Type: String
+    Default: ''
+    Description: >
+      Lambda layer providing matplotlib, for chart rendering. Built and passed in
+      by deploy.sh. If empty, JSON/CSV/HTML are still produced and charts are skipped.
+
+Conditions:
+  CreateBucket: !Equals [!Ref ResultsBucketName, '']
+  HasChartLayer: !Not [!Equals [!Ref MatplotlibLayerArn, '']]
+  HasBoto3Layer: !Not [!Equals [!Ref Boto3LayerArn, '']]
+  ScheduleOn: !Equals [!Ref ScheduleEnabled, 'true']
+  # ALL means "let evaluate.py use its built-in 13-evaluator list", which it does
+  # when the EVALUATORS environment variable is empty.
+  IsAllEvaluators: !Equals [!Ref Evaluators, 'ALL']
+  HasArchiveBucket: !Not [!Equals [!Ref ArchiveBucket, '']]
+
+Resources:
+
+  # ------------------------------------------------------------------ storage
+
+  ResultsBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateBucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub 'connect-agentcore-eval-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-runs
+            Status: Enabled
+            Prefix: runs/
+            ExpirationInDays: 365
+            NoncurrentVersionExpirationInDays: 30
+          - Id: abort-incomplete-uploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+
+  ResultsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: CreateBucket
+    Properties:
+      Bucket: !Ref ResultsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub '${ResultsBucket.Arn}'
+              - !Sub '${ResultsBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  # Dedup ledger: which sessionIds have already been evaluated.
+  SessionLedger:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-session-ledger'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: sessionId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: sessionId
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # AgentCore Observability target. Pre-created (with the stream) so the very
+  # first run does not race log group creation.
+  ObservabilityLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/bedrock-agentcore/runtimes/${ObservabilityRuntimeName}-DEFAULT'
+      RetentionInDays: !Ref LogRetentionDays
+
+  ObservabilityLogStream:
+    Type: AWS::Logs::LogStream
+    Properties:
+      LogGroupName: !Ref ObservabilityLogGroup
+      LogStreamName: otel-rt-logs
+
+  # ------------------------------------------------------------------- iam
+
+  FunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: read-connect-logs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Logs Insights StartQuery is scoped to the queried log groups;
+              # GetQueryResults takes a queryId, which is not an ARN, so it
+              # cannot be resource-scoped.
+              - Effect: Allow
+                Action: logs:StartQuery
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${ConnectLogGroup}:*'
+                  - !Sub '${ObservabilityLogGroup.Arn}:*'
+                  # StartBatchEvaluation checks the caller can query the span
+                  # index before it accepts the job.
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:aws/spans:*'
+              - Effect: Allow
+                Action:
+                  - logs:GetQueryResults
+                  - logs:StopQuery
+                Resource: '*'
+              # StartBatchEvaluation validates the log groups in dataSourceConfig
+              # using the CALLER's credentials, so this must be on the Lambda role
+              # or the API returns "Cannot verify log group 'aws/spans'".
+              # DescribeLogGroups does not support resource-level permissions.
+              - Effect: Allow
+                Action: logs:DescribeLogGroups
+                Resource: '*'
+        - PolicyName: write-observability
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # FilterLogEvents: the index gate re-reads the still-unindexed
+              # events by time window before re-writing them (wait_indexed.py)
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                  - logs:GetLogEvents
+                  - logs:FilterLogEvents
+                Resource: !Sub '${ObservabilityLogGroup.Arn}:*'
+              - Effect: Allow
+                Action: logs:CreateLogGroup
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*'
+              # Batch evaluation writes per-session scores here, and publish reads
+              # them back. The service creates and configures this log group with
+              # forward-access-session (FAS) credentials derived from THIS role, so
+              # the create/retention/write actions must be granted here too, not
+              # just the read actions publish.py needs.
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutRetentionPolicy
+                  - logs:PutLogEvents
+                  - logs:GetLogEvents
+                  - logs:DescribeLogStreams
+                  - logs:StartQuery
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/evaluations/*'
+        - PolicyName: otlp-trace-ingestion
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # X-Ray OTLP /v1/traces is what makes sessions discoverable
+              - Effect: Allow
+                Action:
+                  - xray:PutSpans
+                  - xray:PutTraceSegments
+                  - xray:PutSpansForIndexing
+                Resource: '*'
+        - PolicyName: agentcore-evaluation
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:StartBatchEvaluation
+                  - bedrock-agentcore:GetBatchEvaluation
+                  - bedrock-agentcore:ListBatchEvaluations
+                  - bedrock-agentcore:StopBatchEvaluation
+                  - bedrock-agentcore:StartRecommendation
+                  - bedrock-agentcore:GetRecommendation
+                  - bedrock-agentcore:ListRecommendations
+                  - bedrock-agentcore:Evaluate
+                Resource: '*'
+              - Effect: Allow
+                Action: bedrock-agentcore:GetEvaluator
+                Resource: !Sub 'arn:${AWS::Partition}:bedrock-agentcore:::evaluator/*'
+        - PolicyName: results-and-ledger
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !If [CreateBucket, !GetAtt ResultsBucket.Arn, !Sub 'arn:${AWS::Partition}:s3:::${ResultsBucketName}']
+                  - !If [CreateBucket, !Sub '${ResultsBucket.Arn}/*', !Sub 'arn:${AWS::Partition}:s3:::${ResultsBucketName}/*']
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                Resource: !GetAtt SessionLedger.Arn
+              - !If
+                - HasArchiveBucket
+                - Effect: Allow
+                  Action:
+                    - s3:GetObject
+                    - s3:ListBucket
+                  Resource:
+                    - !Sub 'arn:${AWS::Partition}:s3:::${ArchiveBucket}'
+                    - !Sub 'arn:${AWS::Partition}:s3:::${ArchiveBucket}/*'
+                - !Ref 'AWS::NoValue'
+
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: invoke-functions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !GetAtt CollectFunction.Arn
+                  - !GetAtt IngestFunction.Arn
+                  - !GetAtt WaitIndexedFunction.Arn
+                  - !GetAtt EvaluateFunction.Arn
+                  - !GetAtt RecommendFunction.Arn
+                  - !GetAtt PublishFunction.Arn
+        - PolicyName: logging
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: '*'
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Condition: ScheduleOn
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+      Policies:
+        - PolicyName: start-pipeline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref PipelineStateMachine
+
+  # -------------------------------------------------------------- functions
+
+  CollectFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-collect'
+      Runtime: python3.12
+      Handler: collect.handler
+      Role: !GetAtt FunctionRole.Arn
+      Timeout: 900
+      MemorySize: 1024
+      Layers: !If [HasBoto3Layer, [!Ref Boto3LayerArn], !Ref 'AWS::NoValue']
+      Code: ./src
+      Environment:
+        Variables:
+          RESULTS_BUCKET: !If [CreateBucket, !Ref ResultsBucket, !Ref ResultsBucketName]
+          LEDGER_TABLE: !Ref SessionLedger
+          CONNECT_LOG_GROUP: !Ref ConnectLogGroup
+          LOOKBACK_HOURS: !Ref LookbackHours
+          MAX_AGE_DAYS: !Ref MaxAgeDays
+          OVERLAP_MINUTES: !Ref OverlapMinutes
+          SETTLE_MINUTES: !Ref SettleMinutes
+          LEDGER_TTL_DAYS: !Ref LedgerTtlDays
+          MAX_SESSIONS_PER_RUN: !Ref MaxSessionsPerRun
+
+  IngestFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-ingest'
+      Runtime: python3.12
+      Handler: ingest.handler
+      Role: !GetAtt FunctionRole.Arn
+      Timeout: 600
+      MemorySize: 1024
+      Layers: !If [HasBoto3Layer, [!Ref Boto3LayerArn], !Ref 'AWS::NoValue']
+      Code: ./src
+      Environment:
+        Variables:
+          RESULTS_BUCKET: !If [CreateBucket, !Ref ResultsBucket, !Ref ResultsBucketName]
+          OBSERVABILITY_RUNTIME_NAME: !Ref ObservabilityRuntimeName
+          SHIFT_OLDER_THAN_DAYS: !Ref ShiftOlderThanDays
+
+  WaitIndexedFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-wait-indexed'
+      Runtime: python3.12
+      Handler: wait_indexed.handler
+      Role: !GetAtt FunctionRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Layers: !If [HasBoto3Layer, [!Ref Boto3LayerArn], !Ref 'AWS::NoValue']
+      Code: ./src
+      Environment:
+        Variables:
+          RESULTS_BUCKET: !If [CreateBucket, !Ref ResultsBucket, !Ref ResultsBucketName]
+          OBSERVABILITY_RUNTIME_NAME: !Ref ObservabilityRuntimeName
+          INDEX_BUDGET_SECONDS: !Ref IndexBudgetSeconds
+          REQUIRE_SPAN_INDEX: !Ref RequireSpanIndex
+
+  EvaluateFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-evaluate'
+      Runtime: python3.12
+      Handler: evaluate.handler
+      Role: !GetAtt FunctionRole.Arn
+      Timeout: 900
+      MemorySize: 512
+      Layers: !If [HasBoto3Layer, [!Ref Boto3LayerArn], !Ref 'AWS::NoValue']
+      Code: ./src
+      Environment:
+        Variables:
+          RESULTS_BUCKET: !If [CreateBucket, !Ref ResultsBucket, !Ref ResultsBucketName]
+          EVALUATORS: !If [IsAllEvaluators, '', !Ref Evaluators]
+          INSIGHTS: !Ref Insights
+          EVAL_BUDGET_SECONDS: '780'
+
+  RecommendFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-recommend'
+      Runtime: python3.12
+      Handler: recommend.handler
+      Role: !GetAtt FunctionRole.Arn
+      Timeout: 900
+      MemorySize: 1024
+      Layers: !If [HasBoto3Layer, [!Ref Boto3LayerArn], !Ref 'AWS::NoValue']
+      Code: ./src
+      Environment:
+        Variables:
+          RESULTS_BUCKET: !If [CreateBucket, !Ref ResultsBucket, !Ref ResultsBucketName]
+          RECOMMENDATION_EVALUATOR: !Ref RecommendationEvaluator
+          REC_BUDGET_SECONDS: '780'
+
+  PublishFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-publish'
+      Runtime: python3.12
+      Handler: publish.handler
+      Role: !GetAtt FunctionRole.Arn
+      Timeout: 600
+      MemorySize: 2048
+      Code: ./src
+      Layers: !If
+        - HasChartLayer
+        - !If [HasBoto3Layer, [!Ref Boto3LayerArn, !Ref MatplotlibLayerArn], [!Ref MatplotlibLayerArn]]
+        - !If [HasBoto3Layer, [!Ref Boto3LayerArn], !Ref 'AWS::NoValue']
+      Environment:
+        Variables:
+          RESULTS_BUCKET: !If [CreateBucket, !Ref ResultsBucket, !Ref ResultsBucketName]
+          LEDGER_TABLE: !Ref SessionLedger
+          LEDGER_TTL_DAYS: !Ref LedgerTtlDays
+
+  # --------------------------------------------------------- orchestration
+
+  PipelineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/vendedlogs/states/${AWS::StackName}'
+      RetentionInDays: !Ref LogRetentionDays
+
+  PipelineStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${AWS::StackName}-pipeline'
+      RoleArn: !GetAtt StateMachineRole.Arn
+      LoggingConfiguration:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt PipelineLogGroup.Arn
+      TracingConfiguration:
+        Enabled: true
+      DefinitionSubstitutions:
+        CollectArn: !GetAtt CollectFunction.Arn
+        IngestArn: !GetAtt IngestFunction.Arn
+        WaitIndexedArn: !GetAtt WaitIndexedFunction.Arn
+        IndexMaxAttempts: !Ref IndexMaxAttempts
+        EvaluateArn: !GetAtt EvaluateFunction.Arn
+        RecommendArn: !GetAtt RecommendFunction.Arn
+        PublishArn: !GetAtt PublishFunction.Arn
+      DefinitionString: |
+        {
+          "Comment": "Connect AI Agent logs -> AgentCore Evaluation / Insights / Recommendation -> S3",
+          "StartAt": "Collect",
+          "States": {
+            "Collect": {
+              "Type": "Task",
+              "Resource": "${CollectArn}",
+              "ResultPath": "$.collect",
+              "Retry": [{
+                "ErrorEquals": ["States.TaskFailed", "Lambda.ServiceException",
+                                "Lambda.TooManyRequestsException"],
+                "IntervalSeconds": 20, "MaxAttempts": 2, "BackoffRate": 2
+              }],
+              "Next": "AnySessions"
+            },
+            "AnySessions": {
+              "Type": "Choice",
+              "Choices": [{
+                "Variable": "$.collect.sessionCount",
+                "NumericGreaterThan": 0,
+                "Next": "Ingest"
+              }],
+              "Default": "NothingToDo"
+            },
+            "NothingToDo": {
+              "Type": "Succeed",
+              "Comment": "No finished, not-yet-evaluated session in the window"
+            },
+            "Ingest": {
+              "Type": "Task",
+              "Resource": "${IngestArn}",
+              "Parameters": {
+                "runId.$": "$.collect.runId",
+                "manifestKey.$": "$.collect.manifestKey"
+              },
+              "ResultPath": "$.ingest",
+              "Retry": [{
+                "ErrorEquals": ["States.TaskFailed"],
+                "IntervalSeconds": 30, "MaxAttempts": 2, "BackoffRate": 2
+              }],
+              "Next": "WaitIndexed"
+            },
+            "WaitIndexed": {
+              "Type": "Task",
+              "Resource": "${WaitIndexedArn}",
+              "Parameters": {
+                "runId.$": "$.collect.runId",
+                "indexAttempt": 0
+              },
+              "ResultPath": "$.index",
+              "Next": "IndexReady"
+            },
+            "IndexReady": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.index.indexed",
+                  "BooleanEquals": true,
+                  "Next": "Analyze"
+                },
+                {
+                  "Comment": "indexAttempt counts exhausted attempts from 0, so >= N means N attempts were spent",
+                  "Variable": "$.index.indexAttempt",
+                  "NumericGreaterThanEquals": ${IndexMaxAttempts},
+                  "Next": "IndexingTimedOut"
+                }
+              ],
+              "Default": "PauseForIndexing"
+            },
+            "PauseForIndexing": {
+              "Comment": "Logs Insights can take minutes to index a new stream; the log events are already durable in CloudWatch, so waiting is safe and cheap",
+              "Type": "Wait",
+              "Seconds": 120,
+              "Next": "RetryWaitIndexed"
+            },
+            "RetryWaitIndexed": {
+              "Type": "Task",
+              "Resource": "${WaitIndexedArn}",
+              "Parameters": {
+                "runId.$": "$.collect.runId",
+                "indexAttempt.$": "$.index.indexAttempt"
+              },
+              "ResultPath": "$.index",
+              "Next": "IndexReady"
+            },
+            "IndexingTimedOut": {
+              "Type": "Fail",
+              "Error": "LogEventsNotIndexed",
+              "Cause": "Ingested log events did not become visible to CloudWatch Logs Insights. The converted sessions are preserved in S3 under runs/<runId>/sessions/ - re-run the state machine to retry evaluation."
+            },
+            "Analyze": {
+              "Type": "Parallel",
+              "Comment": "evaluators and insights are mutually exclusive per job, but jobs run concurrently",
+              "Branches": [
+                {
+                  "StartAt": "Evaluate",
+                  "States": {
+                    "Evaluate": {
+                      "Type": "Task",
+                      "Resource": "${EvaluateArn}",
+                      "Parameters": {
+                        "runId.$": "$.collect.runId",
+                        "mode": "evaluators"
+                      },
+                      "End": true
+                    }
+                  }
+                },
+                {
+                  "StartAt": "Insights",
+                  "States": {
+                    "Insights": {
+                      "Type": "Task",
+                      "Resource": "${EvaluateArn}",
+                      "Parameters": {
+                        "runId.$": "$.collect.runId",
+                        "mode": "insights"
+                      },
+                      "Catch": [{
+                        "ErrorEquals": ["States.ALL"],
+                        "Comment": "Insights is in public preview; never fail the run over it",
+                        "ResultPath": "$.error",
+                        "Next": "InsightsSkipped"
+                      }],
+                      "End": true
+                    },
+                    "InsightsSkipped": {
+                      "Type": "Pass",
+                      "End": true
+                    }
+                  }
+                },
+                {
+                  "StartAt": "Recommend",
+                  "States": {
+                    "Recommend": {
+                      "Type": "Task",
+                      "Resource": "${RecommendArn}",
+                      "Parameters": {
+                        "runId.$": "$.collect.runId"
+                      },
+                      "Catch": [{
+                        "ErrorEquals": ["States.ALL"],
+                        "Comment": "optimization advice is a bonus; scores still publish without it",
+                        "ResultPath": "$.error",
+                        "Next": "RecommendSkipped"
+                      }],
+                      "End": true
+                    },
+                    "RecommendSkipped": {
+                      "Type": "Pass",
+                      "End": true
+                    }
+                  }
+                }
+              ],
+              "ResultPath": "$.analyze",
+              "Next": "Publish"
+            },
+            "Publish": {
+              "Type": "Task",
+              "Resource": "${PublishArn}",
+              "Parameters": {
+                "runId.$": "$.collect.runId"
+              },
+              "ResultPath": "$.publish",
+              "Retry": [{
+                "ErrorEquals": ["States.TaskFailed"],
+                "IntervalSeconds": 30, "MaxAttempts": 2, "BackoffRate": 2
+              }],
+              "End": true
+            }
+          }
+        }
+
+  PipelineSchedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: ScheduleOn
+    Properties:
+      Name: !Sub '${AWS::StackName}-daily'
+      Description: Daily Connect AI Agent evaluation run
+      ScheduleExpression: !Ref ScheduleExpression
+      ScheduleExpressionTimezone: UTC
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      State: ENABLED
+      Target:
+        Arn: !Ref PipelineStateMachine
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"source": "schedule"}'
+        RetryPolicy:
+          MaximumRetryAttempts: 2
+
+  # Alarm on pipeline failures so a broken run is noticed without watching S3.
+  PipelineFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-pipeline-failed'
+      AlarmDescription: An evaluation pipeline execution failed.
+      Namespace: AWS/States
+      MetricName: ExecutionsFailed
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref PipelineStateMachine
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  ResultsBucket:
+    Description: S3 bucket holding every run's output.
+    Value: !If [CreateBucket, !Ref ResultsBucket, !Ref ResultsBucketName]
+  ResultsPrefix:
+    Description: Download results from here.
+    Value: !Sub
+      - 's3://${Bucket}/runs/'
+      - Bucket: !If [CreateBucket, !Ref ResultsBucket, !Ref ResultsBucketName]
+  StateMachineArn:
+    Description: Run the pipeline on demand with run-now.sh or StartExecution.
+    Value: !Ref PipelineStateMachine
+  ObservabilityLogGroup:
+    Description: AgentCore Observability log group receiving the converted events.
+    Value: !Ref ObservabilityLogGroup
+  ServiceName:
+    Description: Service name AgentCore uses to discover the sessions.
+    Value: !Sub '${ObservabilityRuntimeName}.DEFAULT'
+  SessionLedgerTable:
+    Description: DynamoDB table preventing duplicate evaluation of a session.
+    Value: !Ref SessionLedger

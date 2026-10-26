@@ -100,3 +100,14 @@ aws logs tail "/aws/connect/ai-agent-logs-<InstanceAlias>" --region <region> --f
 - 查询已有投递源/投递关系时,若调用返回 `ClientError`,脚本会忽略该错误并继续创建;另外代码只读取一次 `describe_*` 的返回结果,未做翻页处理。
 - 脚本**不提供**删除/清理功能,如需移除上述资源需自行在 AWS 中删除。
 - `config-*.json` 含邮箱与账号信息,请勿提交到公开仓库。
+
+## 7. 后续: AgentCore 自动评估
+
+日志投递就绪后，可以用 [agentcore-evaluation/](agentcore-evaluation/README.md) 定时把 AI Agent 日志转换成 OTEL span，交给 Amazon Bedrock AgentCore 做 Evaluation(13 个内置评估器)、Insights 与 Recommendation(系统提示词 / 工具描述优化)，结果写到 S3。它读取同一批 `cloudfront/config-*.json`:
+
+```bash
+cd agentcore-evaluation
+./find-connect-log-group.sh --instance <实例key>   # 确认日志组, 得到 ai_log_arn
+./deploy.sh --instance <实例key>
+./run-now.sh --instance <实例key> --hours 48
+```
