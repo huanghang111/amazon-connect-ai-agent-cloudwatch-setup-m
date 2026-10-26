@@ -268,7 +268,7 @@ python3 -m pip install --quiet --upgrade \
 BOTO_VER="$(python3 -c "
 import pathlib,sys
 p=[d.name for d in pathlib.Path('${BOTO_DIR}/python').glob('boto3-*.dist-info')]
-print(p[0].split('-')[1] if p else 'unknown')")"
+print(p[0][len('boto3-'):-len('.dist-info')] if p else 'unknown')")"
 find "${BOTO_DIR}/python" -name "__pycache__" -type d -prune -exec rm -rf {} + 2>/dev/null || true
 (cd "${BOTO_DIR}" && zip -qr boto3-layer.zip python)
 echo "    boto3 ${BOTO_VER} ($(( $(wc -c < "${BOTO_DIR}/boto3-layer.zip") / 1024 / 1024 )) MB)，正在发布 ..."
